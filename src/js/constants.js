@@ -85,10 +85,14 @@ function buf2b64(buf) {
     for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     return btoa(s);
 }
-function b642buf(s) {
-    const b = atob(s), u = new Uint8Array(b.length);
+function b642u8(s) {
+    const b = atob(String(s || ''));
+    const u = new Uint8Array(b.length);
     for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
-    return u.buffer;
+    return u;
+}
+function b642buf(s) {
+    return b642u8(s).buffer;
 }
 
 function pwStrength(pw) {

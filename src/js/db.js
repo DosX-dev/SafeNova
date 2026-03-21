@@ -22,13 +22,24 @@ const DB = (() => {
                     db.createObjectStore('vfs', { keyPath: 'cid' });
                 }
             };
-            req.onsuccess = e => { _db = e.target.result; res(); };
+            req.onsuccess = e => {
+                _db = e.target.result;
+                _db.onversionchange = () => {
+                    try { _db.close(); } catch { }
+                    _db = null;
+                };
+                res();
+            };
+            req.onblocked = () => rej(new Error('Database upgrade blocked by another open tab'));
             req.onerror = () => rej(req.error);
         });
     }
 
-    function rw(store) { return _db.transaction(store, 'readwrite').objectStore(store); }
-    function ro(store) { return _db.transaction(store, 'readonly').objectStore(store); }
+    function _ensureDb() {
+        if (!_db) throw new Error('Database is not initialized');
+    }
+    function rw(store) { _ensureDb(); return _db.transaction(store, 'readwrite').objectStore(store); }
+    function ro(store) { _ensureDb(); return _db.transaction(store, 'readonly').objectStore(store); }
     function wrap(req) { return new Promise((r, j) => { req.onsuccess = () => r(req.result); req.onerror = () => j(req.error); }); }
 
     return {

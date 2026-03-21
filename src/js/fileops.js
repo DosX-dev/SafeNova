@@ -1300,8 +1300,8 @@ async function importContainerFile(file) {
             if (!nameRaw || !saltB64 || !verIvB64 || !verBlob)
                 throw new Error('Invalid container.xml: missing required fields');
 
-            const salt = Array.from(Uint8Array.from(atob(saltB64), ch => ch.charCodeAt(0))),
-                verIv = Array.from(Uint8Array.from(atob(verIvB64), ch => ch.charCodeAt(0)));
+            const salt = Array.from(b642u8(saltB64)),
+                verIv = Array.from(b642u8(verIvB64));
 
             if (entries['meta/2'] && entries['meta/3']) {
                 // v3: import without password — encrypted workspace stored as-is, expanded on first unlock
