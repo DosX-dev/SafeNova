@@ -697,7 +697,7 @@ async function doUnlock() {
                 const decBuf = await Crypto.decrypt(key, Array.from(mIv), buf2b64(mBlob));
                 const manifest = JSON.parse(new TextDecoder().decode(decBuf));
                 for (const m of manifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
+                    const iv = Array.from(b642u8(m.ivB64)),
                         blob = bin.slice(m.offset, m.offset + m.size).buffer;
                     await DB.saveFile({ id: m.id, cid: c.id, iv, blob });
                 }
@@ -801,7 +801,7 @@ async function _resumeSession(c, rawKeyBytes) {
                 const decBuf = await Crypto.decrypt(key, Array.from(mIv), buf2b64(mBlob));
                 const manifest = JSON.parse(new TextDecoder().decode(decBuf));
                 for (const m of manifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
+                    const iv = Array.from(b642u8(m.ivB64)),
                         blob = bin.slice(m.offset, m.offset + m.size).buffer;
                     await DB.saveFile({ id: m.id, cid: c.id, iv, blob });
                 }

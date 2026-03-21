@@ -15,72 +15,112 @@
    ============================================================ */
 let _sessionKey = null;
 
+function _hasAnySavedSessions() {
+    for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i);
+        if (k && k.startsWith('snv-s-')) return true;
+    }
+    for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('snv-sb-')) return true;
+    }
+    return false;
+}
+
+function _dropSessionKeyIfUnused() {
+    if (_hasAnySavedSessions()) return;
+    _sessionKey = null;
+    sessionStorage.removeItem('snv-sk');
+}
+
 async function _getOrCreateSessionKey() {
     if (_sessionKey) return _sessionKey;
     const stored = sessionStorage.getItem('snv-sk');
     if (stored) {
         try {
-            const raw = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+            const raw = b642u8(stored);
             _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+            raw.fill(0);
             return _sessionKey;
         } catch { /* corrupted — regenerate below */ }
     }
     const raw = crypto.getRandomValues(new Uint8Array(32));
-    const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-    const exported = await crypto.subtle.exportKey('raw', exp);
-    sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...new Uint8Array(exported))));
-    // Re-import as non-extractable for forward secrecy within this session
-    _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-    return _sessionKey;
-}
-
-// Browser-scope sessions expire after 7 days; tab-scope persist until tab closes
-const SESSION_TTL_BROWSER = 7 * 24 * 60 * 60 * 1000;
-
-// rawKeyBytes — Uint8Array(32) from Crypto.deriveRaw(), never the plaintext password
-async function saveSession(cid, rawKeyBytes, scope) {
-    const key = await _getOrCreateSessionKey(),
-        iv = crypto.getRandomValues(new Uint8Array(12));
-    const expiryMs = scope === 'browser' ? Date.now() + SESSION_TTL_BROWSER : Number.MAX_SAFE_INTEGER;
-    const payload = new Uint8Array(8 + rawKeyBytes.length);
-    new DataView(payload.buffer).setBigUint64(0, BigInt(expiryMs), true);
-    payload.set(rawKeyBytes, 8);
-    const aad = new TextEncoder().encode('snv-session:' + cid);
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload);
-    const blob = new Uint8Array(12 + ct.byteLength);
-    blob.set(iv);
-    blob.set(new Uint8Array(ct), 12);
-    const b64 = btoa(String.fromCharCode(...blob));
-    if (scope === 'browser') {
-        localStorage.setItem('snv-sb-' + cid, b64);
-        sessionStorage.removeItem('snv-s-' + cid);
-    } else {
-        sessionStorage.setItem('snv-s-' + cid, b64);
-        localStorage.removeItem('snv-sb-' + cid);
+    let exportedU8 = null;
+    try {
+        const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+        const exported = await crypto.subtle.exportKey('raw', exp);
+        exportedU8 = new Uint8Array(exported);
+        sessionStorage.setItem('snv-sk', buf2b64(exportedU8));
+        // Re-import as non-extractable for forward secrecy within this session
+        _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        return _sessionKey;
+    } finally {
+        raw.fill(0);
+        if (exportedU8) exportedU8.fill(0);
     }
 }
 
-// Returns Uint8Array(32) raw key bytes on success, or null on failure/expiry
+async function saveSession(cid, password, scope) {
+    const key = await _getOrCreateSessionKey(),
+        iv = crypto.getRandomValues(new Uint8Array(12));
+    const pwBytes = new TextEncoder().encode(password || '');
+    let ctU8 = null;
+    let blob = null;
+    try {
+        const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, pwBytes);
+        blob = new Uint8Array(12 + ct.byteLength);
+        ctU8 = new Uint8Array(ct);
+        blob.set(iv, 0);
+        blob.set(ctU8, 12);
+        const b64 = buf2b64(blob);
+        if (scope === 'browser') {
+            localStorage.setItem('snv-sb-' + cid, b64);
+            sessionStorage.removeItem('snv-s-' + cid);
+        } else {
+            sessionStorage.setItem('snv-s-' + cid, b64);
+            localStorage.removeItem('snv-sb-' + cid);
+        }
+    } finally {
+        pwBytes.fill(0);
+        if (ctU8) ctU8.fill(0);
+        if (blob) blob.fill(0);
+    }
+}
+
 async function loadSession(cid) {
+    return null;
+}
+
+async function loadSessionKey(cid, salt) {
     const b64 = sessionStorage.getItem('snv-s-' + cid) || localStorage.getItem('snv-sb-' + cid);
     if (!b64) return null;
+    let blob = null;
+    let iv = null;
+    let ct = null;
+    let dec = null;
+    let decU8 = null;
     try {
-        const key = await _getOrCreateSessionKey(),
-            blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0)),
-            iv = blob.slice(0, 12),
-            ct = blob.slice(12),
-            aad = new TextEncoder().encode('snv-session:' + cid),
-            dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
-        const payload = new Uint8Array(dec);
-        const expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
-        if (Date.now() > expiry) { clearSession(cid); return null; }
-        return payload.slice(8); // 32-byte raw key material
-    } catch { clearSession(cid); return null; }
+        const key = await _getOrCreateSessionKey();
+        blob = b642u8(b64);
+        iv = blob.slice(0, 12);
+        ct = blob.slice(12);
+        dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+        decU8 = new Uint8Array(dec);
+        return await Crypto.deriveKey(decU8, new Uint8Array(salt || []));
+    } catch {
+        return null;
+    } finally {
+        if (decU8) decU8.fill(0);
+        if (blob) blob.fill(0);
+        if (iv) iv.fill(0);
+        if (ct) ct.fill(0);
+    }
 }
 
 function clearSession(cid) {
     sessionStorage.removeItem('snv-s-' + cid);
     localStorage.removeItem('snv-sb-' + cid);
+    _dropSessionKeyIfUnused();
 }
 
 function hasSession(cid) {
@@ -137,6 +177,11 @@ const App = {
     // Return to home WITHOUT killing the session (password stays remembered)
     async backToMenu() {
         this.key = null;
+        if (this.container) {
+            for (let k of Object.keys(this.container)) {
+                this.container[k] = null;
+            }
+        }
         this.container = null;
         this.folder = 'root';
         this.selection = new Set();
@@ -159,6 +204,14 @@ const App = {
         const cid = this.container?.id;
         if (cid) clearSession(cid);
         this.key = null;
+        
+        // Paranoid: empty the container object completely before releasing it to GC
+        if (this.container) {
+            for (let k of Object.keys(this.container)) {
+                this.container[k] = null;
+            }
+        }
+        
         this.container = null;
         this.folder = 'root';
         this.selection = new Set();
