@@ -107,3 +107,19 @@ SafeNova/
 5. **Lock** the container — the key is wiped from memory
 
 All container data is scoped to the current browser and device. Use **Export Container** to back up or transfer to another device.
+
+---
+
+## 💬 Community
+
+Have questions, ideas, or just want to chat? Here's where to find us:
+
+-   **GitHub Issues**: Report bugs or request features via [Issues](https://github.com/DosX-dev/SafeNova/issues)
+
+---
+
+## 🤝 Thanks to all contributors
+
+<a href="https://github.com/DosX-dev/SafeNova/graphs/contributors">
+<img src="https://readme-contribs.as93.net/contributors/DosX-dev/SafeNova?textColor=737373&perRow=9&shape=squircle&isResponsive=true" />
+</a>
