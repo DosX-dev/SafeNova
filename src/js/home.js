@@ -13,9 +13,9 @@ function _saveCardOrder(ids) {
 
 const Home = {
     async render() {
-        const grid = document.getElementById('container-grid');
-        const empty = document.getElementById('container-empty');
-        const containers = await DB.getContainers();
+        const grid = document.getElementById('container-grid'),
+            empty = document.getElementById('container-empty'),
+            containers = await DB.getContainers();
 
         grid.querySelectorAll('.container-card').forEach(c => c.remove());
 
@@ -23,6 +23,10 @@ const Home = {
             empty.style.display = 'flex';
         } else {
             empty.style.display = 'none';
+            // Re-validate stored sessions: clear stale/expired ones before rendering badges
+            for (const c of containers) {
+                if (hasSession(c.id)) await loadSession(c.id);
+            }
             const savedOrder = _loadCardOrder();
             containers.sort((a, b) => {
                 const ia = savedOrder.indexOf(a.id), ib = savedOrder.indexOf(b.id);
@@ -36,8 +40,8 @@ const Home = {
         await updateStorageInfo();
 
         // ---- Persistent visibility: warning box (only when 1+ container exists) ----
-        const warnBox = document.getElementById('home-warning-box');
-        const dismissBtn = document.getElementById('warning-dismiss');
+        const warnBox = document.getElementById('home-warning-box'),
+            dismissBtn = document.getElementById('warning-dismiss');
         if (warnBox) {
             const shouldShow = containers.length > 0 && localStorage.getItem('snv-warn-hide') !== '1';
             warnBox.classList.toggle('hidden', !shouldShow);
@@ -50,9 +54,9 @@ const Home = {
         }
 
         // ---- Persistent visibility: doc block ----
-        const docEl = document.getElementById('home-doc');
-        const docTab = document.getElementById('home-doc-tab');
-        const collapseBtn = document.getElementById('home-doc-collapse');
+        const docEl = document.getElementById('home-doc'),
+            docTab = document.getElementById('home-doc-tab'),
+            collapseBtn = document.getElementById('home-doc-collapse');
         const _applyDoc = (hidden) => {
             if (!docEl || !docTab) return;
             docEl.classList.toggle('collapsed', hidden);
@@ -80,10 +84,10 @@ const Home = {
     },
 
     _makeCard(c) {
-        const pct = Math.min((c.totalSize || 0) / CONTAINER_LIMIT * 100, 100);
-        const fill = pct > 90 ? 'danger' : pct > 70 ? 'warn' : '';
-        const hasSess = !!(sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id));
-        const card = document.createElement('div');
+        const pct = Math.min((c.totalSize || 0) / CONTAINER_LIMIT * 100, 100),
+            fill = pct > 90 ? 'danger' : pct > 70 ? 'warn' : '',
+            hasSess = hasSession(c.id),
+            card = document.createElement('div');
         card.className = 'container-card';
         card.dataset.id = c.id;
         card.innerHTML = `
@@ -159,7 +163,7 @@ const Home = {
             const sourceId = e.dataTransfer.getData('text/plain');
             if (!sourceId || sourceId === c.id) return;
             const grid2 = document.getElementById('container-grid');
-            const sourceCard = grid2.querySelector(`.container-card[data-id="${sourceId}"]`);
+            const sourceCard = grid2.querySelector(`.container-card[data-id="${CSS.escape(sourceId)}"]`);
             if (!sourceCard) return;
             const all = [...grid2.querySelectorAll('.container-card')];
             const fromIdx = all.indexOf(sourceCard);
@@ -170,14 +174,9 @@ const Home = {
             _saveCardOrder(newOrder);
         });
 
-        card.addEventListener('click', e => {
+        card.addEventListener('click', async e => {
             if (e.target.closest('.container-card-menu') || e.target.closest('.container-drag-handle')) return;
-            const savedPw = sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id);
-            if (savedPw) {
-                _resumeSession(c, savedPw);
-            } else {
-                openUnlockView(c);
-            }
+            _tryOpenContainer(c);
         });
         card.querySelector('.container-card-menu').addEventListener('click', e => {
             e.stopPropagation();
@@ -189,16 +188,16 @@ const Home = {
 
 /* ---- Container context menu ---- */
 function showContainerMenu(e, c) {
-    const hasSess = !!(sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id));
-    const isOpen = App.container && App.container.id === c.id;
-    const items = [];
+    const hasSess = hasSession(c.id),
+        isOpen = App.container && App.container.id === c.id,
+        reqExpPw = c.settings?.requireExportPassword !== false,
+        items = [];
 
     // Open — resume if session exists, otherwise go to unlock view
     items.push({
-        label: 'Open', icon: Icons.unlock, action: () => {
-            const savedPw = sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id);
-            if (savedPw) _resumeSession(c, savedPw); else openUnlockView(c);
-        }
+        label: 'Open', icon: Icons.unlock,
+        _keyHint: !hasSess ? '<span class="auth-dot"></span>' : null,
+        action: () => _tryOpenContainer(c)
     });
     items.push({ sep: true });
 
@@ -209,7 +208,9 @@ function showContainerMenu(e, c) {
     // Change Password — always visible, disabled when session active or container open
     const cpDisabled = hasSess || isOpen;
     items.push({
-        label: 'Change Password…', icon: Icons.key, disabled: cpDisabled,
+        label: 'Change Password…', icon: Icons.key,
+        _keyHint: !cpDisabled ? '<span class="auth-dot"></span>' : null,
+        disabled: cpDisabled,
         _tooltip: cpDisabled ? 'End the active session first' : null,
         action: cpDisabled ? null : () => openChangePasswordModal(c)
     });
@@ -223,7 +224,11 @@ function showContainerMenu(e, c) {
     });
 
     items.push({ sep: true });
-    items.push({ label: 'Export Container', icon: Icons.download, action: () => exportContainerFile(c) });
+    items.push({
+        label: 'Export Container', icon: Icons.download,
+        _keyHint: reqExpPw ? '<span class="auth-dot"></span>' : null,
+        action: () => exportContainerFile(c, reqExpPw)
+    });
     items.push({ sep: true });
     items.push({ label: 'Delete Container...', icon: Icons.trash, danger: true, action: () => confirmDeleteContainer(c) });
     showCtxMenu(e.clientX, e.clientY, items);
@@ -231,8 +236,12 @@ function showContainerMenu(e, c) {
 
 /* ---- Kill Session ---- */
 function killSession(c) {
-    sessionStorage.removeItem('twc-s-' + c.id);
-    localStorage.removeItem('twc-s-' + c.id);
+    // Notify any tab that has this container open — they will call lockContainer() via the
+    // storage event listener.  forceClaimSession writes kick=true; we then immediately clean
+    // up the claim entry (we're on the home page, not opening this container ourselves).
+    _forceClaimSession(c.id);
+    _stopContainerSession(c.id); // removes the kick entry we just wrote
+    clearSession(c.id);
     toast(`Session for "${c.name}" terminated`, 'info');
     Home.render();
 }
@@ -249,62 +258,91 @@ function openChangePasswordModal(c) {
 }
 
 async function doChangePassword() {
-    const okBtn = document.getElementById('cp-ok');
-    const c = okBtn._container; if (!c) return;
-    const oldPw = document.getElementById('cp-old').value;
-    const newPw = document.getElementById('cp-new').value;
-    const newPw2 = document.getElementById('cp-new2').value;
-    const errEl = document.getElementById('cp-error');
+    const okBtn = document.getElementById('cp-ok'),
+        c = okBtn._container;
+    if (!c) return;
+    const oldPw = document.getElementById('cp-old').value,
+        newPw = document.getElementById('cp-new').value,
+        newPw2 = document.getElementById('cp-new2').value,
+        errEl = document.getElementById('cp-error');
 
     if (!oldPw) { errEl.textContent = 'Enter current password'; return; }
     if (newPw.length < 4) { errEl.textContent = 'New password must be at least 4 characters'; return; }
     if (newPw !== newPw2) { errEl.textContent = 'Passwords do not match'; return; }
     if (oldPw === newPw) { errEl.textContent = 'New password must differ from current'; return; }
 
-    errEl.textContent = '';
-    Overlay.hide();
-    showLoading('Verifying current password…');
+    // Rate-limit check
+    const cpKey = 'cp:' + c.id,
+        cpFails = _failCounts.get(cpKey) || { count: 0, lockUntil: 0 };
+    if (cpFails.lockUntil > Date.now()) return;
+
+    errEl.innerHTML = '';
+    okBtn.disabled = true;
+    let _cpInModal = true;
 
     try {
         // Verify old password
-        const oldKey = await Crypto.deriveKey(oldPw, new Uint8Array(c.salt));
-        const ok = await Crypto.checkVerification(oldKey, c.verIv, c.verBlob);
-        if (!ok) { hideLoading(); toast('Incorrect current password', 'error'); return; }
-
+        const oldKey = await Crypto.deriveKey(oldPw, new Uint8Array(c.salt)),
+            ok = await Crypto.checkVerification(oldKey, c.verIv, c.verBlob);
+        if (!ok) {
+            cpFails.count++;
+            _failCounts.set(cpKey, cpFails);
+            if (cpFails.count > 3) {
+                cpFails.lockUntil = Date.now() + 3000;
+                _startAttemptCooldown(errEl, okBtn, () => { cpFails.lockUntil = 0; });
+            } else {
+                errEl.innerHTML = `${_ERR_SVG} Incorrect current password`;
+                okBtn.disabled = false;
+            }
+            return;
+        }
+        _cpInModal = false;
+        _failCounts.delete(cpKey);
+        Overlay.hide();
         showLoading('Deriving new key…');
-        const newSalt = Array.from(crypto.getRandomValues(new Uint8Array(32)));
-        const newKey = await Crypto.deriveKey(newPw, new Uint8Array(newSalt));
+
+        const newSalt = Array.from(crypto.getRandomValues(new Uint8Array(32))),
+            newKey = await Crypto.deriveKey(newPw, new Uint8Array(newSalt));
 
         // Re-encrypt VFS
         showLoading('Re-encrypting VFS…');
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
-            const vfsBuf = await Crypto.decrypt(oldKey, vfsRec.iv, vfsRec.blob);
-            const vfsText = new TextDecoder().decode(vfsBuf);
-            const { iv: newVfsIv, blob: newVfsBlob } = await Crypto.encrypt(newKey, vfsText);
+            const vfsBuf = typeof vfsRec.blob === 'string'
+                ? await Crypto.decrypt(oldKey, vfsRec.iv, vfsRec.blob)
+                : await Crypto.decryptBin(oldKey, vfsRec.iv, vfsRec.blob);
+            const { iv: newVfsIv, blob: newVfsBlob } = await Crypto.encryptBin(newKey, vfsBuf);
             await DB.saveVFS(c.id, newVfsIv, newVfsBlob);
         }
 
-        // Re-encrypt all files
+        // Re-encrypt all files fully in parallel (Web Crypto is async/hardware-accelerated;
+        // browser schedules concurrent SubtleCrypto calls across available cores)
         const files = await DB.getFilesByCid(c.id);
-        for (let i = 0; i < files.length; i++) {
-            showLoading(`Re-encrypting file ${i + 1} / ${files.length}…`);
-            const f = files[i];
+        showLoading(`Re-encrypting files\u2026 0/${files.length}`);
+        let _reencDone = 0;
+        const reencResults = await Promise.allSettled(files.map(async f => {
             const buf = await Crypto.decryptBin(oldKey, f.iv, f.blob);
             const { iv, blob } = await Crypto.encryptBin(newKey, buf);
-            await DB.saveFile({ id: f.id, cid: f.cid, iv: Array.from(iv), blob });
-        }
+            _reencDone++;
+            if (_reencDone % 4 === 0 || _reencDone === files.length)
+                showLoading(`Re-encrypting files\u2026 ${_reencDone}/${files.length}`);
+            return { id: f.id, cid: f.cid, iv: Array.from(iv), blob };
+        }));
+        const reencFiles = reencResults
+            .filter(r => r.status === 'fulfilled')
+            .map(r => r.value);
+        if (reencFiles.length) await DB.saveFiles(reencFiles);
 
         // Re-encrypt lazyWorkspace manifest if present (imported-but-never-unlocked containers)
         if (c.lazyWorkspace) {
             showLoading('Re-encrypting workspace…');
             const { bin, mIv, mBlob } = c.lazyWorkspace;
-            const manifestBuf = await Crypto.decrypt(oldKey, Array.from(mIv), buf2b64(mBlob));
-            const reEnc = await Crypto.encrypt(newKey, manifestBuf);
+            const manifestBuf = await Crypto.decryptBin(oldKey, Array.from(mIv), mBlob.buffer || mBlob);
+            const reEnc = await Crypto.encryptBin(newKey, manifestBuf);
             c.lazyWorkspace = {
                 bin,
                 mIv: new Uint8Array(reEnc.iv),
-                mBlob: new Uint8Array(b642buf(reEnc.blob)),
+                mBlob: new Uint8Array(reEnc.blob),
             };
         }
 
@@ -319,15 +357,19 @@ async function doChangePassword() {
         await DB.saveContainer(c);
 
         // Clear any stored sessions (password changed)
-        sessionStorage.removeItem('twc-s-' + c.id);
-        localStorage.removeItem('twc-s-' + c.id);
+        clearSession(c.id);
 
         hideLoading();
         toast(`Password for "${c.name}" changed successfully`, 'success');
         Home.render();
     } catch (e) {
-        hideLoading();
-        toast('Change password failed: ' + e.message, 'error');
+        if (_cpInModal) {
+            okBtn.disabled = false;
+            errEl.innerHTML = `${_ERR_SVG} ${e.message}`;
+        } else {
+            hideLoading();
+            toast('Change password failed: ' + e.message, 'error');
+        }
         console.error(e);
     }
 }
@@ -345,10 +387,11 @@ function openRenameContainerModal(c) {
 }
 
 async function doRenameContainer() {
-    const okBtn = document.getElementById('rc-ok');
-    const c = okBtn._container; if (!c) return;
-    const name = document.getElementById('rc-name').value.trim();
-    const errEl = document.getElementById('rc-error');
+    const okBtn = document.getElementById('rc-ok'),
+        c = okBtn._container;
+    if (!c) return;
+    const name = document.getElementById('rc-name').value.trim(),
+        errEl = document.getElementById('rc-error');
 
     if (!name) { errEl.textContent = 'Enter a name'; return; }
     const nameRegex = /^[a-zA-Zа-яА-ЯёЁ0-9 _\-.,!()@#$%&+=]+$/;
@@ -371,8 +414,8 @@ function confirmDeleteContainer(c) {
     document.getElementById('dc-name').textContent = c.name;
     document.getElementById('dc-msg').textContent =
         `Container "${c.name}" and ALL its files will be permanently erased. This cannot be undone.`;
-    const okBtn = document.getElementById('dc-ok');
-    const okLabel = document.getElementById('dc-ok-label');
+    const okBtn = document.getElementById('dc-ok'),
+        okLabel = document.getElementById('dc-ok-label');
     okBtn._container = c;
     okBtn.disabled = true;
     Overlay.show('modal-del-container');
@@ -497,8 +540,8 @@ function openNewContainerModal() {
 
 /** Generate salt using WebAuthn passkey mixed with CSPRNG */
 async function _webAuthnSalt() {
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const userId = crypto.getRandomValues(new Uint8Array(16));
+    const challenge = crypto.getRandomValues(new Uint8Array(32)),
+        userId = crypto.getRandomValues(new Uint8Array(16));
     const cred = await navigator.credentials.create({
         publicKey: {
             challenge,
@@ -521,9 +564,9 @@ async function _webAuthnSalt() {
 }
 
 async function createContainer() {
-    const name = document.getElementById('nc-name').value.trim();
-    const pw = document.getElementById('nc-pw').value;
-    const pw2 = document.getElementById('nc-pw2').value;
+    const name = document.getElementById('nc-name').value.trim(),
+        pw = document.getElementById('nc-pw').value,
+        pw2 = document.getElementById('nc-pw2').value;
 
     if (!name) { toast('Enter a container name', 'error'); return; }
     // Allow only letters (Latin + Cyrillic), digits, spaces, and safe filename chars
@@ -547,13 +590,13 @@ async function createContainer() {
     showLoading('Creating container and deriving key...');
     Overlay.hide();
     try {
-        const salt = _hwSaltData || Array.from(crypto.getRandomValues(new Uint8Array(32)));
-        const key = await Crypto.deriveKey(pw, new Uint8Array(salt));
+        const salt = _hwSaltData || Array.from(crypto.getRandomValues(new Uint8Array(32))),
+            key = await Crypto.deriveKey(pw, new Uint8Array(salt));
         const { iv, blob } = await Crypto.makeVerification(key);
 
         VFS.init();
-        const vfsStr = JSON.stringify(VFS.toObj());
-        const { iv: vfsIv, blob: vfsBlobB64 } = await Crypto.encrypt(key, vfsStr);
+        const vfsStr = JSON.stringify(VFS.toObj()),
+            { iv: vfsIv, blob: vfsBlobB64 } = await Crypto.encrypt(key, vfsStr);
 
         const container = {
             id: uid(), name, createdAt: Date.now(),
@@ -569,12 +612,12 @@ async function createContainer() {
 }
 
 function updatePwStrength(pw) {
-    const s = pwStrength(pw);
-    const pct = [0, 20, 40, 60, 80, 100][s];
-    const colors = ['#555', '#f44747', '#ce9178', '#dcdcaa', '#6a9955', '#4ec9b0'];
-    const labels = ['', 'Very Weak', 'Weak', 'Fair', 'Strong', 'Very Strong'];
-    const bar = document.getElementById('nc-pw-strength');
-    const lbl = document.getElementById('nc-pw-strength-label');
+    const s = pwStrength(pw),
+        pct = [0, 20, 40, 60, 80, 100][s],
+        colors = ['#555', '#f44747', '#ce9178', '#dcdcaa', '#6a9955', '#4ec9b0'],
+        labels = ['', 'Very Weak', 'Weak', 'Fair', 'Strong', 'Very Strong'],
+        bar = document.getElementById('nc-pw-strength'),
+        lbl = document.getElementById('nc-pw-strength-label');
     bar.style.width = pct + '%';
     bar.style.background = colors[s];
     lbl.textContent = pw.length ? labels[s] : '';
@@ -588,25 +631,12 @@ let _unlockContainer = null;
 const _failCounts = new Map(); // containerId → { count, lockUntil }
 
 function _startUnlockCooldown(c) {
-    const errEl = document.getElementById('unlock-error');
-    const btnEl = document.getElementById('btn-unlock');
-    let remaining = 3;
-    errEl.innerHTML = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M7 4v3.5l2.5 1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg> Too many attempts — wait ${remaining}s`;
-    errEl.style.color = 'var(--orange)';
-    btnEl.disabled = true;
-    const timer = setInterval(() => {
-        remaining--;
-        if (remaining <= 0) {
-            clearInterval(timer);
-            const fails = _failCounts.get(c.id);
-            if (fails) fails.lockUntil = 0;
-            errEl.textContent = '';
-            errEl.style.color = '';
-            btnEl.disabled = false;
-        } else {
-            errEl.innerHTML = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M7 4v3.5l2.5 1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg> Too many attempts — wait ${remaining}s`;
-        }
-    }, 1000);
+    const fails = _failCounts.get(c.id);
+    _startAttemptCooldown(
+        document.getElementById('unlock-error'),
+        document.getElementById('btn-unlock'),
+        () => { if (fails) fails.lockUntil = 0; }
+    );
 }
 
 function openUnlockView(c) {
@@ -616,18 +646,18 @@ function openUnlockView(c) {
     document.getElementById('unlock-error').innerHTML = '';
     document.getElementById('unlock-spinner').classList.remove('show');
     // Pre-fill checkbox and scope based on saved session
-    const hasSessT = !!sessionStorage.getItem('twc-s-' + c.id);
-    const hasSessW = !!localStorage.getItem('twc-s-' + c.id);
-    const remEl = document.getElementById('unlock-remember');
-    const opts = document.getElementById('remember-opts');
-    const tabEl = document.getElementById('remember-tab');
-    const brwEl = document.getElementById('remember-browser');
+    const hasSessT = !!sessionStorage.getItem('snv-s-' + c.id),
+        hasSessW = !!localStorage.getItem('snv-sb-' + c.id),
+        remEl = document.getElementById('unlock-remember'),
+        opts = document.getElementById('remember-opts'),
+        tabEl = document.getElementById('remember-tab'),
+        brwEl = document.getElementById('remember-browser');
     if (remEl) {
         const remembered = hasSessT || hasSessW;
         remEl.checked = remembered;
         if (opts) {
-            const radios = opts.querySelectorAll('input[type="radio"]');
-            const labels = opts.querySelectorAll('.remember-opt');
+            const radios = opts.querySelectorAll('input[type="radio"]'),
+                labels = opts.querySelectorAll('.remember-opt');
             radios.forEach(r => r.disabled = !remembered);
             labels.forEach(l => l.classList.toggle('disabled', !remembered));
         }
@@ -637,6 +667,40 @@ function openUnlockView(c) {
     App.showView('unlock');
     setTimeout(() => document.getElementById('unlock-pw').focus(), 100);
 }
+
+// ── Tab deduplication guard ───────────────────────────────────
+
+/** Show the session-conflict modal; `onConfirm` is called if the user
+ *  chooses to force-close the other session. */
+function _showSessionConflict(c, onConfirm) {
+    document.getElementById('sc-cont-name').textContent = c.name;
+    document.getElementById('sc-force').onclick = () => {
+        _forceClaimSession(c.id);
+        Overlay.hide();
+        onConfirm?.();
+    };
+    document.getElementById('sc-cancel').onclick = () => Overlay.hide();
+    Overlay.show('modal-session-conflict');
+}
+
+/**
+ * Single entry point for opening any container.
+ * Checks for cross-tab conflict FIRST (before any password prompt),
+ * then resumes an existing session or shows the unlock view.
+ */
+async function _tryOpenContainer(c) {
+    if (_checkContainerSession(c.id)) {
+        _showSessionConflict(c, async () => {
+            // Other tab has been kicked — proceed with open
+            const savedPw = await loadSession(c.id);
+            if (savedPw) _resumeSession(c, savedPw); else openUnlockView(c);
+        });
+        return;
+    }
+    const savedPw = await loadSession(c.id);
+    if (savedPw) _resumeSession(c, savedPw); else openUnlockView(c);
+}
+// ────────────────────────────────────────────────────────────────
 
 async function doUnlock() {
     const c = _unlockContainer; if (!c) return;
@@ -652,8 +716,8 @@ async function doUnlock() {
     document.getElementById('btn-unlock').disabled = true;
 
     try {
-        const key = await Crypto.deriveKey(pw, new Uint8Array(c.salt));
-        const ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
+        const { key, raw: _sessionRawKey } = await Crypto.deriveKeyAndRaw(pw, new Uint8Array(c.salt)),
+            ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
 
         if (!ok) {
             fails.count++;
@@ -669,11 +733,13 @@ async function doUnlock() {
             return;
         }
 
-        // Load VFS
+        // Load VFS (detect binary vs legacy base64 format)
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
             try {
-                const buf = await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob);
+                const buf = typeof vfsRec.blob === 'string'
+                    ? await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob)
+                    : await Crypto.decryptBin(key, vfsRec.iv, vfsRec.blob);
                 const json = JSON.parse(new TextDecoder().decode(buf));
                 VFS.fromObj(json);
             } catch { VFS.init(); }
@@ -685,13 +751,14 @@ async function doUnlock() {
             showLoading('Restoring files from import\u2026');
             try {
                 const { bin, mIv, mBlob } = c.lazyWorkspace;
-                const decBuf = await Crypto.decrypt(key, Array.from(mIv), buf2b64(mBlob));
+                const decBuf = await Crypto.decryptBin(key, Array.from(mIv), mBlob.buffer || mBlob);
                 const manifest = JSON.parse(new TextDecoder().decode(decBuf));
-                for (const m of manifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0)));
-                    const blob = bin.slice(m.offset, m.offset + m.size).buffer;
-                    await DB.saveFile({ id: m.id, cid: c.id, iv, blob });
-                }
+                const filesToSave = manifest.map(m => ({
+                    id: m.id, cid: c.id,
+                    iv: Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
+                    blob: bin.slice(m.offset, m.offset + m.size).buffer
+                }));
+                await DB.saveFiles(filesToSave);
                 const cleanCont = Object.assign({}, c);
                 delete cleanCont.lazyWorkspace;
                 await DB.saveContainer(cleanCont);
@@ -710,25 +777,22 @@ async function doUnlock() {
         App.key = key;
         App.folder = 'root';
         App.selection.clear();
+        _startContainerSession(_activeCont.id);
         App.showView('desktop');
-        if (typeof _applySettings === 'function') _applySettings(_getSettings());
+        if (typeof _applySettings === 'function') _applySettings(_getSettings(), true);
+        if (typeof _resetAutoLockTimer === 'function') _resetAutoLockTimer();
         Desktop.render();
         toast(`Container "${c.name}" unlocked`, 'success');
-        // Save or clear session based on checkbox
+        // Save or clear session based on checkbox — uses rawKey already derived above (no second Argon2)
         const remEl = document.getElementById('unlock-remember');
         if (remEl && remEl.checked) {
             const scope = document.querySelector('input[name="remember-scope"]:checked')?.value || 'tab';
-            if (scope === 'browser') {
-                try { localStorage.setItem('twc-s-' + c.id, pw); } catch (e) { }
-                sessionStorage.removeItem('twc-s-' + c.id);
-            } else {
-                try { sessionStorage.setItem('twc-s-' + c.id, pw); } catch (e) { }
-                localStorage.removeItem('twc-s-' + c.id);
-            }
+            try {
+                await saveSession(c.id, _sessionRawKey, scope);
+            } catch { /* non-critical */ }
         } else {
             // Checkbox unchecked — clear any previously saved session
-            sessionStorage.removeItem('twc-s-' + c.id);
-            localStorage.removeItem('twc-s-' + c.id);
+            clearSession(c.id);
         }
     } catch (e) {
         document.getElementById('unlock-error').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg> ' + escHtml(e.message);
@@ -754,8 +818,7 @@ async function deleteContainerConfirmed() {
     try {
         await DB.nukeContainer(c.id);
         // Also clear any remembered session for this container
-        try { sessionStorage.removeItem('twc-s-' + c.id); } catch (e) { }
-        try { localStorage.removeItem('twc-s-' + c.id); } catch (e) { }
+        clearSession(c.id);
         hideLoading();
         await Home.render();
         toast(`Container \"${c.name}\" deleted`, 'info');
@@ -768,15 +831,14 @@ async function deleteContainerConfirmed() {
 /* ============================================================
    SESSION RESUME  —  auto-unlock using stored sessionStorage password
    ============================================================ */
-async function _resumeSession(c, pw) {
+async function _resumeSession(c, rawKeyBytes) {
     showLoading('Restoring session...');
     try {
-        const key = await Crypto.deriveKey(pw, new Uint8Array(c.salt));
-        const ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
+        const key = await Crypto.importRawKey(rawKeyBytes),
+            ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
         if (!ok) {
             // Stored session is invalid (password changed?) — clear it and open unlock view
-            sessionStorage.removeItem('twc-s-' + c.id);
-            localStorage.removeItem('twc-s-' + c.id);
+            clearSession(c.id);
             hideLoading();
             openUnlockView(c);
             return;
@@ -784,7 +846,9 @@ async function _resumeSession(c, pw) {
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
             try {
-                const buf = await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob);
+                const buf = typeof vfsRec.blob === 'string'
+                    ? await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob)
+                    : await Crypto.decryptBin(key, vfsRec.iv, vfsRec.blob);
                 const json = JSON.parse(new TextDecoder().decode(buf));
                 VFS.fromObj(json);
             } catch { VFS.init(); }
@@ -794,13 +858,14 @@ async function _resumeSession(c, pw) {
         if (c.lazyWorkspace) {
             try {
                 const { bin, mIv, mBlob } = c.lazyWorkspace;
-                const decBuf = await Crypto.decrypt(key, Array.from(mIv), buf2b64(mBlob));
+                const decBuf = await Crypto.decryptBin(key, Array.from(mIv), mBlob.buffer || mBlob);
                 const manifest = JSON.parse(new TextDecoder().decode(decBuf));
-                for (const m of manifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0)));
-                    const blob = bin.slice(m.offset, m.offset + m.size).buffer;
-                    await DB.saveFile({ id: m.id, cid: c.id, iv, blob });
-                }
+                const filesToSave = manifest.map(m => ({
+                    id: m.id, cid: c.id,
+                    iv: Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
+                    blob: bin.slice(m.offset, m.offset + m.size).buffer
+                }));
+                await DB.saveFiles(filesToSave);
                 const cleanCont = Object.assign({}, c);
                 delete cleanCont.lazyWorkspace;
                 await DB.saveContainer(cleanCont);
@@ -814,8 +879,10 @@ async function _resumeSession(c, pw) {
         App.key = key;
         App.folder = 'root';
         App.selection.clear();
+        _startContainerSession(c.id);
         App.showView('desktop');
-        if (typeof _applySettings === 'function') _applySettings(_getSettings());
+        if (typeof _applySettings === 'function') _applySettings(_getSettings(), true);
+        if (typeof _resetAutoLockTimer === 'function') _resetAutoLockTimer();
         Desktop.render();
         toast(`Session for "${c.name}" restored`, 'success');
     } catch (e) {

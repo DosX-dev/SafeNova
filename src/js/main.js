@@ -1,11 +1,56 @@
 'use strict';
 
 /* ============================================================
+   CONSOLE SECURITY WARNING
+   ============================================================ */
+(function consoleSecurityWarning() {
+    const W = 60,
+        pad = s => s + ' '.repeat(Math.max(0, W - s.length)),
+        row = s => `║ ${pad(s)} ║`,
+        top = `╔${'═'.repeat(W + 2)}╗`,
+        bot = `╚${'═'.repeat(W + 2)}╝`,
+        sep = `╠${'═'.repeat(W + 2)}╣`,
+        _ = row('');
+
+    const box = [
+        top,
+        _,
+        row('  DO NOT paste any code or commands into this console.'),
+        row('  Not from the internet. Not from anyone. For any reason.'),
+        _,
+        sep,
+        _,
+        row('  A single malicious snippet can silently:'),
+        row('    \u203a  intercept and exfiltrate your encryption keys'),
+        row('    \u203a  dump the entire local file storage in plaintext'),
+        row('    \u203a  steal your container password as you type'),
+        row('    \u203a  re-encrypt your files with an attacker-controlled key'),
+        _,
+        sep,
+        _,
+        row('  [!] Only use this console if you know what you are doing.'),
+        row('      If someone told you to paste something here \u2014'),
+        row('      you are being socially engineered.'),
+        _,
+        bot,
+    ].join('\n');
+
+    const show = () => console.log(
+        '%c STOP %c SafeNova \u2014 Security Warning\n%c\n' + box,
+        'font-size:13px;font-weight:900;color:#1e1e1e;background:#f44747;padding:2px 10px;border-radius:2px;font-family:Consolas,monospace',
+        'font-size:13px;font-weight:700;color:#f44747;font-family:Consolas,monospace',
+        'font-size:12px;color:#d4d4d4;line-height:1;font-family:Consolas,monospace'
+    );
+    show();
+    setInterval(show, 5_000);
+})();
+
+/* ============================================================
    PASSWORD EYE TOGGLE
    ============================================================ */
 function togglePwEye(inputId, btnId) {
-    const input = document.getElementById(inputId);
-    const btn = document.getElementById(btnId);
+    const input = document.getElementById(inputId),
+        btn = document.getElementById(btnId);
     if (input.type === 'password') {
         input.type = 'text';
         btn.style.color = 'var(--accent)';
@@ -64,8 +109,8 @@ function initEvents() {
     document.getElementById('unlock-remember').addEventListener('change', e => {
         const opts = document.getElementById('remember-opts');
         if (!opts) return;
-        const radios = opts.querySelectorAll('input[type="radio"]');
-        const labels = opts.querySelectorAll('.remember-opt');
+        const radios = opts.querySelectorAll('input[type="radio"]'),
+            labels = opts.querySelectorAll('.remember-opt');
         radios.forEach(r => r.disabled = !e.target.checked);
         labels.forEach(l => l.classList.toggle('disabled', !e.target.checked));
     });
@@ -197,8 +242,8 @@ function initEvents() {
         const dd = document.getElementById('topbar-dropdown');
         if (!burger || !dd) return;
 
-        const _close = () => dd.classList.remove('open');
-        const _toggle = () => dd.classList.toggle('open');
+        const _close = () => dd.classList.remove('open'),
+            _toggle = () => dd.classList.toggle('open');
 
         burger.addEventListener('click', e => { e.stopPropagation(); _toggle(); });
 
@@ -238,3 +283,35 @@ window.addEventListener('DOMContentLoaded', async () => {
     initEvents();
     await App.init();
 });
+
+/* ============================================================
+   CROSS-TAB SESSION GUARD
+   ============================================================ */
+// When another tab claims (or force-kicks) our container, lock immediately.
+window.addEventListener('storage', e => {
+    // ── Kick: another tab force-claimed our container ──────────
+    if (App.container && e.key === 'snv-open-' + App.container.id) {
+        try {
+            const d = e.newValue ? JSON.parse(e.newValue) : null;
+            if (d && d.tab !== _TAB_ID && d.kick) {
+                App.lockContainer();
+                toast('This container was opened in another tab — session ended.', 'warn');
+            }
+        } catch { /* ignore corrupt value */ }
+    }
+
+    // ── Session badge live-update: any session blob change ─────
+    // When another tab saves or clears a remembered session, refresh the home
+    // view so the "Session active" badge is immediately up-to-date.
+    if (App.view === 'home' && e.key && (e.key.startsWith('snv-sb-') || e.key.startsWith('snv-s-'))) {
+        Home.render();
+    }
+});
+
+// Release the session claim on tab close / navigation.
+// Both beforeunload (desktop) and pagehide (mobile / bfcache) are needed.
+function _onTabUnload() {
+    if (App.container?.id) _stopContainerSession(App.container.id);
+}
+window.addEventListener('beforeunload', _onTabUnload);
+window.addEventListener('pagehide', _onTabUnload);

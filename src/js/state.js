@@ -1,6 +1,276 @@
 'use strict';
 
 /* ============================================================
+   SESSION ENCRYPTION  —  AES-256-GCM encrypted session storage
+
+   Two distinct encryption keys are used, one per scope:
+
+   Tab-scope  (snv-s-{cid}  in sessionStorage):
+   • Encrypted with snv-sk — a per-tab AES key in sessionStorage.
+   • Survives page refresh within the same tab; dies when the tab
+     is closed (sessionStorage is wiped).
+
+   Persistent  (snv-sb-{cid}  in localStorage)  ["Stay signed in"]:
+   • Encrypted with snv-bsk — a shared AES-256-GCM key in localStorage.
+   • snv-bsk itself is AES-GCM-encrypted before being stored — the
+     wrapping key is derived on-the-fly via HKDF from a browser
+     fingerprint (origin, language, hardwareConcurrency, colorDepth)
+     and NEVER written to any storage.  Copying localStorage to a
+     different machine/browser usually produces a different fingerprint
+     → wrap-key differs → snv-bsk undecryptable → blobs opaque.
+     NOTE: navigator.userAgent is intentionally excluded from the
+     fingerprint because Chrome auto-updates silently and would
+     invalidate the session on every update.
+   • Survives browser restarts until the 7-day TTL expires or the
+     user explicitly signs out.
+
+   Separation guarantees:
+   • Tab-scope blobs → only the originating tab can decrypt them
+     (key in sessionStorage, not shared).
+   • Persistent blobs → any tab of the SAME browser can decrypt
+     them (shared snv-bsk, same fingerprint → same wrap-key).
+   • A copied localStorage is useless without the matching browser.
+   ============================================================ */
+
+/* ── Tab-scope session key (sessionStorage, per-tab) ── */
+let _sessionKey = null;
+
+async function _getOrCreateSessionKey() {
+    if (_sessionKey) return _sessionKey;
+    const stored = sessionStorage.getItem('snv-sk');
+    if (stored) {
+        try {
+            const raw = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+            _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+            return _sessionKey;
+        } catch { /* corrupted — regenerate below */ }
+    }
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+    const exported = await crypto.subtle.exportKey('raw', exp);
+    sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...new Uint8Array(exported))));
+    _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    return _sessionKey;
+}
+
+/* ── Browser fingerprint → HKDF wrap-key (never stored) ──
+   Derived deterministically from STABLE browser properties.
+   Intentionally excludes navigator.userAgent (changes on every
+   Chrome silent auto-update) and navigator.platform (deprecated).
+   Properties used are stable across browser version updates. */
+let _browserWrapKey = null;
+
+function _getBrowserFingerprint() {
+    const n = navigator, s = screen;
+    return [
+        window.location.origin,              // deployment-bound (stable)
+        n.language            || '',          // system language (rarely changes)
+        String(n.hardwareConcurrency || 0),   // CPU core count (stable)
+        String(s.colorDepth        || 0),     // display bit depth (stable)
+        String(s.pixelDepth        || 0),
+    ].join('\x00');
+}
+
+async function _getOrCreateBrowserWrapKey() {
+    if (_browserWrapKey) return _browserWrapKey;
+    const fpBytes = new TextEncoder().encode(_getBrowserFingerprint());
+    const hkdf = await crypto.subtle.importKey('raw', fpBytes, 'HKDF', false, ['deriveKey']);
+    const salt = new Uint8Array(32); // all-zero deterministic salt
+    const info = new TextEncoder().encode('snv-browser-wrap-v1');
+    _browserWrapKey = await crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256', salt, info },
+        hkdf,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+    return _browserWrapKey;
+}
+
+/* ── Browser-scope session key (localStorage, shared across all tabs, wrap-encrypted) ── */
+let _browserScopeKey = null;
+
+async function _getOrCreateBrowserScopeKey() {
+    if (_browserScopeKey) return _browserScopeKey;
+    const wrapKey = await _getOrCreateBrowserWrapKey();
+    const stored = localStorage.getItem('snv-bsk');
+    if (stored) {
+        const blobBytes = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+        // Legacy format (pre-fingerprint-wrap): exactly 32 raw bytes, no IV prefix.
+        // Migrate on-the-fly: import the raw key, re-wrap it, overwrite localStorage.
+        if (blobBytes.length === 32) {
+            try {
+                const legacyKey = await crypto.subtle.importKey('raw', blobBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+                const rawExported = await crypto.subtle.exportKey('raw', legacyKey);
+                const wrapIV = crypto.getRandomValues(new Uint8Array(12));
+                const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, rawExported);
+                const newBlob = new Uint8Array(12 + ct.byteLength);
+                newBlob.set(wrapIV);
+                newBlob.set(new Uint8Array(ct), 12);
+                localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...newBlob)));
+                _browserScopeKey = await crypto.subtle.importKey('raw', rawExported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                return _browserScopeKey;
+            } catch { /* corrupted legacy key — regenerate below */ }
+        } else {
+            // Current format: IV(12) + AES-GCM(CT) wrapping the 32-byte raw key
+            try {
+                const iv = blobBytes.slice(0, 12), ct = blobBytes.slice(12);
+                const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, wrapKey, ct);
+                _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                return _browserScopeKey;
+            } catch { /* fingerprint changed or corrupted — regenerate below */ }
+        }
+    }
+    // Generate fresh snv-bsk and wrap it with the browser-specific key before storing
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    const wrapIV = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw);
+    const blob = new Uint8Array(12 + ct.byteLength);
+    blob.set(wrapIV);
+    blob.set(new Uint8Array(ct), 12);
+    localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...blob)));
+    _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    return _browserScopeKey;
+}
+
+// Browser-scope sessions expire after 7 days; tab-scope persist until tab closes
+const SESSION_TTL_BROWSER = 7 * 24 * 60 * 60 * 1000;
+
+async function _encryptSessionPayload(key, cid, rawKeyBytes, expiryMs) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const payload = new Uint8Array(8 + rawKeyBytes.length);
+    new DataView(payload.buffer).setBigUint64(0, BigInt(expiryMs), true);
+    payload.set(rawKeyBytes, 8);
+    const aad = new TextEncoder().encode('snv-session:' + cid);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload);
+    const blob = new Uint8Array(12 + ct.byteLength);
+    blob.set(iv);
+    blob.set(new Uint8Array(ct), 12);
+    return btoa(String.fromCharCode(...blob));
+}
+
+async function _decryptSessionPayload(key, cid, b64) {
+    const blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
+    const iv = blob.slice(0, 12), ct = blob.slice(12);
+    const aad = new TextEncoder().encode('snv-session:' + cid);
+    const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
+    const payload = new Uint8Array(dec);
+    const expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
+    if (Date.now() > expiry) return null; // expired
+    return payload.slice(8); // 32-byte raw key material
+}
+
+// rawKeyBytes — Uint8Array(32) from Crypto.deriveRaw(), never the plaintext password
+async function saveSession(cid, rawKeyBytes, scope) {
+    if (scope === 'browser') {
+        // Use the shared browser-scope key so ALL tabs can resume this session
+        const key = await _getOrCreateBrowserScopeKey();
+        const b64 = await _encryptSessionPayload(key, cid, rawKeyBytes, Date.now() + SESSION_TTL_BROWSER);
+        localStorage.setItem('snv-sb-' + cid, b64);
+        sessionStorage.removeItem('snv-s-' + cid);
+    } else {
+        // Use the per-tab key; only this tab can decrypt it
+        const key = await _getOrCreateSessionKey();
+        const b64 = await _encryptSessionPayload(key, cid, rawKeyBytes, Number.MAX_SAFE_INTEGER);
+        sessionStorage.setItem('snv-s-' + cid, b64);
+        localStorage.removeItem('snv-sb-' + cid);
+    }
+}
+
+// Returns Uint8Array(32) raw key bytes on success, or null on failure/expiry
+async function loadSession(cid) {
+    // Tab-scope first — per-tab key, lives in sessionStorage
+    const tabBlob = sessionStorage.getItem('snv-s-' + cid);
+    if (tabBlob) {
+        try {
+            const key = await _getOrCreateSessionKey();
+            const raw = await _decryptSessionPayload(key, cid, tabBlob);
+            if (raw) return raw;
+            // null means expired
+            sessionStorage.removeItem('snv-s-' + cid);
+        } catch {
+            // Corrupted tab blob — belongs to this tab, safe to clear
+            sessionStorage.removeItem('snv-s-' + cid);
+        }
+    }
+
+    // Browser-scope — shared key, any tab can decrypt
+    const browserBlob = localStorage.getItem('snv-sb-' + cid);
+    if (browserBlob) {
+        try {
+            const key = await _getOrCreateBrowserScopeKey();
+            const raw = await _decryptSessionPayload(key, cid, browserBlob);
+            if (raw) return raw;
+            // null means expired
+            localStorage.removeItem('snv-sb-' + cid);
+        } catch {
+            // Corrupted blob — remove it
+            localStorage.removeItem('snv-sb-' + cid);
+        }
+    }
+
+    return null;
+}
+
+function clearSession(cid) {
+    sessionStorage.removeItem('snv-s-' + cid);
+    localStorage.removeItem('snv-sb-' + cid);
+}
+
+function hasSession(cid) {
+    return !!(sessionStorage.getItem('snv-s-' + cid) || localStorage.getItem('snv-sb-' + cid));
+}
+
+/* ============================================================
+   TAB SESSION GUARD
+   Prevents the same container from being opened in two tabs
+   simultaneously. Uses localStorage for cross-tab visibility
+   and a heartbeat to detect stale (dead tab) claims.
+   ============================================================ */
+const _OPEN_TTL = 30000; // consider stale after 6 missed heartbeats (heartbeat = 5 s)
+let _sessionHeartbeat = null;
+
+function _openKey(cid) { return 'snv-open-' + cid; }
+
+/** Returns true if another live tab currently has this container open. */
+function _checkContainerSession(cid) {
+    try {
+        const raw = localStorage.getItem(_openKey(cid));
+        if (!raw) return false;
+        const d = JSON.parse(raw);
+        return !!(d && d.tab !== _TAB_ID && (Date.now() - d.ts) < _OPEN_TTL);
+    } catch { return false; }
+}
+
+/** Claim the container session for this tab and start heartbeat. */
+function _startContainerSession(cid) {
+    const write = () => localStorage.setItem(_openKey(cid), JSON.stringify({ tab: _TAB_ID, ts: Date.now() }));
+    write();
+    if (_sessionHeartbeat) clearInterval(_sessionHeartbeat);
+    _sessionHeartbeat = setInterval(() => {
+        if (App.container?.id === cid) write(); else _stopContainerSession(cid);
+    }, 5000);
+}
+
+/** Release the container session claim for this tab. */
+function _stopContainerSession(cid) {
+    if (_sessionHeartbeat) { clearInterval(_sessionHeartbeat); _sessionHeartbeat = null; }
+    if (!cid) return;
+    try {
+        const raw = localStorage.getItem(_openKey(cid));
+        if (raw) {
+            const d = JSON.parse(raw);
+            if (d.tab === _TAB_ID) localStorage.removeItem(_openKey(cid));
+        }
+    } catch { localStorage.removeItem(_openKey(cid)); }
+}
+
+/** Force-claim: writes kick flag → causes the other tab to lock itself via storage event. */
+function _forceClaimSession(cid) {
+    localStorage.setItem(_openKey(cid), JSON.stringify({ tab: _TAB_ID, ts: Date.now(), kick: true }));
+}
+
+/* ============================================================
    APP STATE
    ============================================================ */
 const App = {
@@ -49,6 +319,8 @@ const App = {
 
     // Return to home WITHOUT killing the session (password stays remembered)
     async backToMenu() {
+        document.title = 'SafeNova';
+        if (this.container?.id) _stopContainerSession(this.container.id);
         this.key = null;
         this.container = null;
         this.folder = 'root';
@@ -69,12 +341,9 @@ const App = {
     },
 
     async lockContainer() {
+        document.title = 'SafeNova';
         const cid = this.container?.id;
-        // Kill stored session so password is not remembered after locking
-        if (cid) {
-            sessionStorage.removeItem('twc-s-' + cid);
-            localStorage.removeItem('twc-s-' + cid);
-        }
+        if (cid) { _stopContainerSession(cid); clearSession(cid); }
         this.key = null;
         this.container = null;
         this.folder = 'root';
@@ -172,13 +441,13 @@ async function updateStorageInfo() {
     try {
         if (!navigator.storage?.estimate) return;
         const est = await navigator.storage.estimate();
-        const used = est.usage || 0;
-        const quota = est.quota || 0;
-        const available = quota - used;
+        const used = est.usage || 0,
+            quota = est.quota || 0,
+            available = quota - used;
 
         // Cap the visual scale at DEVICE_LIMIT (20 GB)
-        const displayMax = Math.min(quota > 0 ? quota : DEVICE_LIMIT, DEVICE_LIMIT);
-        const pct = displayMax > 0 ? Math.min((used / displayMax) * 100, 100) : 0;
+        const displayMax = Math.min(quota > 0 ? quota : DEVICE_LIMIT, DEVICE_LIMIT),
+            pct = displayMax > 0 ? Math.min((used / displayMax) * 100, 100) : 0;
 
         const fill = document.getElementById('storage-bar-fill');
         const txt = document.getElementById('storage-text');
@@ -232,8 +501,8 @@ async function updateStorageInfo() {
 async function checkStorageSpace(needed) {
     try {
         if (!navigator.storage?.estimate) return { ok: true, available: Infinity };
-        const est = await navigator.storage.estimate();
-        const available = (est.quota || 0) - (est.usage || 0);
+        const est = await navigator.storage.estimate(),
+            available = (est.quota || 0) - (est.usage || 0);
         // Keep 50 MB safety margin
         if (available - needed < 50 * 1024 * 1024) {
             return { ok: false, available };

@@ -1,12 +1,13 @@
-'use strict';
+﻿'use strict';
 
 /* ============================================================
    FILENAME SANITIZATION
    ============================================================ */
 function sanitizeFilename(name) {
-    // Strip null bytes, path separators, and prevent . / .. as names
+    // Strip null bytes, path separators, HTML/XML special chars, and prevent . / .. as names
     const s = (name || 'unnamed')
         .replace(/[\x00-\x1f\\/]/g, '_')
+        .replace(/[<>&"']/g, '_')
         .trim();
     return /^\.{1,2}$/.test(s) || s === '' ? 'unnamed' : s;
 }
@@ -38,26 +39,46 @@ async function uploadFiles(files) {
     }
 
     showLoading(`Encrypting ${files.length} file${files.length > 1 ? 's' : ''}...`);
-    let ok = 0;
-    for (const f of files) {
-        try {
-            const name = sanitizeFilename(f.name);
-            const buf = await f.arrayBuffer();
-            const mime = f.type || getMime(name);
-            const { iv, blob } = await Crypto.encryptBin(App.key, buf);
-            const nodeId = uid();
+    let ok = 0, _okIds = [];
+    const fileArr = Array.from(files);
+    const BATCH = _CRYPTO_CONCURRENCY;
+    for (let i = 0; i < fileArr.length; i += BATCH) {
+        const batch = fileArr.slice(i, i + BATCH);
+        // Read all file buffers in this batch concurrently before encrypting
+        const bufs = await Promise.all(batch.map(f => f.arrayBuffer()));
+        const results = await Promise.allSettled(batch.map(async (f, bi) => {
+            const name = sanitizeFilename(f.name),
+                mime = f.type || getMime(name),
+                { iv, blob } = await Crypto.encryptBin(App.key, bufs[bi]),
+                nodeId = uid();
             VFS.add({
                 id: nodeId, type: 'file', name, mime, size: f.size,
                 parentId: App.folder, ctime: Date.now(), mtime: Date.now()
             });
-            await DB.saveFile({ id: nodeId, cid: App.container.id, iv: Array.from(iv), blob });
-            ok++;
-        } catch (e) { console.error('upload error', e); toast('Failed to encrypt: ' + f.name, 'error'); }
+            return { nodeId, rec: { id: nodeId, cid: App.container.id, iv: Array.from(iv), blob } };
+        }));
+        // Batch-save all encrypted records in a single IDB transaction
+        const recs = [];
+        for (let j = 0; j < results.length; j++) {
+            if (results[j].status === 'fulfilled') {
+                ok++;
+                _okIds.push(results[j].value.nodeId);
+                recs.push(results[j].value.rec);
+            } else {
+                console.error('upload error', batch[j].name, results[j].reason);
+                toast('Failed to encrypt: ' + batch[j].name, 'error');
+            }
+        }
+        if (recs.length) await DB.saveFiles(recs);
+        showLoading(`Encrypting... ${Math.min(i + BATCH, fileArr.length)}/${fileArr.length}`);
     }
     await saveVFS();
     Desktop._patchIcons();
     hideLoading();
-    if (ok > 0) toast(`${ok} file${ok > 1 ? 's' : ''} imported`, 'success');
+    if (ok > 0) {
+        toast(`${ok} file${ok > 1 ? 's' : ''} imported`, 'success');
+        logActivity('upload', ok === 1 ? files[0].name : `${ok} files`, ok, ok === 1 && _okIds[0] ? VFS.fullPath(_okIds[0]) : null);
+    }
 }
 
 /* ============================================================
@@ -89,10 +110,10 @@ async function _uploadFileEntry(fileEntry, targetFolderId) {
         toast(`"${name}" already exists — skipped`, 'warn');
         return false;
     }
-    const buf = await file.arrayBuffer();
-    const mime = file.type || getMime(name);
-    const { iv, blob } = await Crypto.encryptBin(App.key, buf);
-    const nodeId = uid(), now = Date.now();
+    const buf = await file.arrayBuffer(),
+        mime = file.type || getMime(name),
+        { iv, blob } = await Crypto.encryptBin(App.key, buf),
+        nodeId = uid(), now = Date.now();
     VFS.add({
         id: nodeId, type: 'file', name, mime, size: file.size,
         parentId: targetFolderId, ctime: now, mtime: now
@@ -112,12 +133,18 @@ async function _uploadDirEntry(dirEntry, targetFolderId, depth) {
     const folderId = uid(), now = Date.now();
     VFS.add({ id: folderId, type: 'folder', name, parentId: targetFolderId, ctime: now, mtime: now });
     const entries = await _readAllEntries(dirEntry.createReader());
-    for (const entry of entries) {
-        if (entry.isDirectory) {
-            await _uploadDirEntry(entry, folderId, depth + 1);
-        } else {
-            await _uploadFileEntry(entry, folderId);
-        }
+    const fileEntries = entries.filter(e => e.isFile);
+    const subDirEntries = entries.filter(e => e.isDirectory);
+    // Encrypt files in this directory in parallel batches
+    const BATCH = _CRYPTO_CONCURRENCY;
+    for (let i = 0; i < fileEntries.length; i += BATCH) {
+        await Promise.allSettled(
+            fileEntries.slice(i, i + BATCH).map(e => _uploadFileEntry(e, folderId))
+        );
+    }
+    // Recurse into subdirectories sequentially
+    for (const subDir of subDirEntries) {
+        await _uploadDirEntry(subDir, folderId, depth + 1);
     }
     return true;
 }
@@ -137,8 +164,8 @@ async function uploadEntries(dataTransferItems, targetFolderId) {
         return;
     }
 
-    const fileEntries = entries.filter(e => e.isFile);
-    const folderEntries = entries.filter(e => e.isDirectory);
+    const fileEntries = entries.filter(e => e.isFile),
+        folderEntries = entries.filter(e => e.isDirectory);
     const label = [
         fileEntries.length && `${fileEntries.length} file${fileEntries.length !== 1 ? 's' : ''}`,
         folderEntries.length && `${folderEntries.length} folder${folderEntries.length !== 1 ? 's' : ''}`,
@@ -161,7 +188,13 @@ async function uploadEntries(dataTransferItems, targetFolderId) {
     Desktop._patchIcons();
     if (typeof WinManager !== 'undefined') WinManager.renderAll();
     hideLoading();
-    if (ok > 0) toast(`${ok} item${ok !== 1 ? 's' : ''} imported`, 'success');
+    if (ok > 0) {
+        toast(`${ok} item${ok !== 1 ? 's' : ''} imported`, 'success');
+        {
+            const _sn = ok === 1 ? VFS.children(targetFolderId).find(n => n.name === sanitizeFilename(entries[0]?.name || '')) : null;
+            logActivity('upload', ok === 1 ? (entries[0]?.name ?? '1 item') : `${ok} items`, ok, _sn ? VFS.fullPath(_sn.id) : null);
+        }
+    }
 }
 
 /* ============================================================
@@ -202,6 +235,7 @@ async function downloadFile(node) {
         const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
         downloadBuf(buf, node.name, node.mime || getMime(node.name));
         toast('Exported: ' + node.name, 'success');
+        logActivity('download', node.name, 1, VFS.fullPath(node.id));
     } catch (e) { toast('Decryption failed: ' + e.message, 'error'); }
     hideLoading();
 }
@@ -222,6 +256,7 @@ function _confirmExport(node, buf, mime) {
         Overlay.hide();
         downloadBuf(buf, node.name, mime);
         toast('Exported: ' + node.name, 'success');
+        logActivity('download', node.name, 1, VFS.fullPath(node.id));
     };
 }
 
@@ -234,17 +269,10 @@ async function deleteSelected() {
     const ids = [...selRef];
 
     // Prevent deleting folders currently open in Explorer windows
-    if (typeof WinManager !== 'undefined') {
-        const openFolderIds = new Set();
-        WinManager._wins.forEach(w => {
-            let cur = w.folderId;
-            while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
-        });
-        const blocked = ids.find(id => { const n = VFS.node(id); return n && n.type === 'folder' && openFolderIds.has(id); });
-        if (blocked) {
-            toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
-            return;
-        }
+    const blocked = _openFolderGuard(ids);
+    if (blocked) {
+        toast(`"${VFS.node(blocked)?.name}" is open in Explorer — close the window first`, 'error');
+        return;
     }
 
     const names = ids.map(id => VFS.node(id)?.name || '').filter(Boolean);
@@ -257,25 +285,32 @@ async function deleteSelected() {
     document.getElementById('delete-ok').onclick = async () => {
         Overlay.hide();
         showLoading('Deleting...');
+        const allFileIds = [];
         for (const id of ids) {
             const n = VFS.node(id); if (!n) continue;
             if (n.type === 'file') {
-                try { await DB.deleteFile(id); } catch (e) { }
-                delete App.thumbCache[id];
+                allFileIds.push(id);
             } else {
-                const toDelete = [];
-                const walk = fid => { VFS.children(fid).forEach(c => { if (c.type === 'file') toDelete.push(c.id); else walk(c.id); }); };
+                const _walkSeen = new Set();
+                const walk = fid => {
+                    if (_walkSeen.has(fid)) return;
+                    _walkSeen.add(fid);
+                    VFS.children(fid).forEach(c => { if (c.type === 'file') allFileIds.push(c.id); else walk(c.id); });
+                };
                 walk(id);
-                for (const fid of toDelete) { try { await DB.deleteFile(fid); } catch (e) { } delete App.thumbCache[fid]; }
             }
-            VFS.remove(id);
         }
+        if (allFileIds.length) await DB.deleteFiles(allFileIds).catch(() => {});
+        allFileIds.forEach(fid => { delete App.thumbCache[fid]; });
+        const _delSinglePath = ids.length === 1 ? VFS.fullPath(ids[0]) : null;
+        for (const id of ids) VFS.remove(id);
         selRef.clear();
         await saveVFS();
         Desktop._patchIcons();
         if (typeof WinManager !== 'undefined') WinManager.renderAll();
         hideLoading();
         toast('Deleted', 'info');
+        logActivity('delete', ids.length === 1 ? names[0] : `${ids.length} items`, ids.length, _delSinglePath);
     };
 }
 
@@ -301,11 +336,11 @@ function newTextFile() {
 }
 
 async function createTextFile() {
-    const name = document.getElementById('nf-name').value.trim();
-    if (!name) { toast('Enter a file name', 'error'); return; }
+    const name = sanitizeFilename(document.getElementById('nf-name').value.trim());
+    if (!name || name === 'unnamed') { toast('Enter a valid file name', 'error'); return; }
     // Capture context BEFORE Overlay.hide() clears it
-    const targetFolder = App.folder;
-    const winCtx = App._winCtx;
+    const targetFolder = App.folder,
+        winCtx = App._winCtx;
     // Duplicate name check
     if (VFS.hasChildNamed(targetFolder, name)) {
         toast(`“${name}” already exists in this folder`, 'error'); return;
@@ -340,6 +375,7 @@ async function createTextFile() {
     await saveVFS();
     if (winCtx) winCtx.render(); else Desktop._patchIcons();
     toast(`File “${name}” created`, 'success');
+    logActivity('create-file', name, 1, VFS.fullPath(nodeId));
 }
 
 /* ============================================================
@@ -362,11 +398,11 @@ function newFolder() {
 }
 
 async function createFolder() {
-    const name = document.getElementById('nd-name').value.trim();
-    if (!name) { toast('Enter a folder name', 'error'); return; }
+    const name = sanitizeFilename(document.getElementById('nd-name').value.trim());
+    if (!name || name === 'unnamed') { toast('Enter a valid folder name', 'error'); return; }
     // Capture context BEFORE Overlay.hide() clears it
-    const targetFolder = App.folder;
-    const winCtx = App._winCtx;
+    const targetFolder = App.folder,
+        winCtx = App._winCtx;
     // Duplicate name check
     if (VFS.hasChildNamed(targetFolder, name)) {
         toast(`“${name}” already exists in this folder`, 'error'); return;
@@ -393,6 +429,7 @@ async function createFolder() {
     await saveVFS();
     if (winCtx) winCtx.render(); else Desktop._patchIcons();
     toast(`Folder "${name}" created`, 'success');
+    logActivity('create-folder', name, 1, VFS.fullPath(nodeId));
 }
 
 /* ============================================================
@@ -402,14 +439,10 @@ function renameNode(node) {
     if (!node) return;
 
     // Prevent renaming folders currently open in Explorer windows
-    if (typeof WinManager !== 'undefined' && node.type === 'folder') {
-        const openFolderIds = new Set();
-        WinManager._wins.forEach(w => {
-            let cur = w.folderId;
-            while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
-        });
-        if (openFolderIds.has(node.id)) {
-            toast(`“${node.name}” is open in Explorer — close the window first`, 'error');
+    if (node.type === 'folder') {
+        const blocked = _openFolderGuard([node.id]);
+        if (blocked) {
+        toast(`“${node.name}” is open in Explorer — close the window first`, 'error');
             return;
         }
     }
@@ -424,17 +457,19 @@ function renameNode(node) {
         if (dot > 0) i.setSelectionRange(0, dot); else i.select();
     }, 100);
     document.getElementById('rename-ok').onclick = async () => {
-        const newName = document.getElementById('rename-input').value.trim();
-        if (!newName) { toast('Enter a name', 'error'); return; }
+        const newName = sanitizeFilename(document.getElementById('rename-input').value.trim());
+        if (!newName || newName === 'unnamed') { toast('Enter a valid name', 'error'); return; }
         // Duplicate check (ignore if same name, case-insensitive)
         const pid = VFS.node(node.id)?.parentId;
         if (pid && newName.toLowerCase() !== node.name.toLowerCase() && VFS.hasChildNamed(pid, newName)) {
             toast(`“${newName}” already exists in this folder`, 'error'); return;
         }
         Overlay.hide();
+        const _oldName = node.name;
         VFS.rename(node.id, newName);
         await saveVFS();
         if (capturedWinCtx) capturedWinCtx.render(); else Desktop._patchIcons();
+        logActivity('rename', `${_oldName} → ${newName}`, 1, VFS.fullPath(node.id));
     };
 }
 
@@ -444,27 +479,19 @@ function renameNode(node) {
 function copyItems() {
     App.clipboard = { op: 'copy', ids: [...App.selection] };
     toast(`${App.clipboard.ids.length} item(s) copied`, 'info');
+    logActivity('copy', App.clipboard.ids.length === 1 ? (VFS.node(App.clipboard.ids[0])?.name ?? '1 item') : `${App.clipboard.ids.length} items`, App.clipboard.ids.length, App.clipboard.ids.length === 1 ? VFS.fullPath(App.clipboard.ids[0]) : null);
 }
 function cutItems() {
     // Prevent cutting folders currently open in Explorer windows
-    if (typeof WinManager !== 'undefined') {
-        const openFolderIds = new Set();
-        WinManager._wins.forEach(w => {
-            let cur = w.folderId;
-            while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
-        });
-        const blocked = [...App.selection].find(id => {
-            const n = VFS.node(id);
-            return n && n.type === 'folder' && openFolderIds.has(id);
-        });
-        if (blocked) {
-            toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
-            return;
-        }
+    const blocked = _openFolderGuard(App.selection);
+    if (blocked) {
+        toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
+        return;
     }
 
     App.clipboard = { op: 'cut', ids: [...App.selection] };
     toast(`${App.clipboard.ids.length} item(s) cut`, 'info');
+    logActivity('cut', App.clipboard.ids.length === 1 ? (VFS.node(App.clipboard.ids[0])?.name ?? '1 item') : `${App.clipboard.ids.length} items`, App.clipboard.ids.length, App.clipboard.ids.length === 1 ? VFS.fullPath(App.clipboard.ids[0]) : null);
     _applyCutStyles();
 }
 
@@ -483,23 +510,16 @@ async function pasteItems() {
     const { op, ids } = App.clipboard;
 
     // Prevent pasting a cut folder if it's currently open in Explorer windows
-    if (op === 'cut' && typeof WinManager !== 'undefined') {
-        const openFolderIds = new Set();
-        WinManager._wins.forEach(w => {
-            let cur = w.folderId;
-            while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
-        });
-        const blocked = ids.find(id => {
-            const n = VFS.node(id);
-            return n && n.type === 'folder' && openFolderIds.has(id);
-        });
+    if (op === 'cut') {
+        const blocked = _openFolderGuard(ids);
         if (blocked) {
-            toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
+        toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
             // Abort the entire paste operation to prevent partial moves
             return;
         }
     }
 
+    let _pastedSn = null;
     for (const id of ids) {
         const n = VFS.node(id); if (!n) continue;
         if (op === 'cut') {
@@ -507,10 +527,12 @@ async function pasteItems() {
             const result = VFS.move(id, App.folder);
             if (result === 'duplicate') { toast(`"${n.name}" already exists in this folder`, 'error'); continue; }
             if (result === 'cycle') { toast(`Cannot paste "${n.name}" into itself or a subfolder`, 'error'); continue; }
+            _pastedSn = n.name;
         } else {
             let name = n.name;
             if (VFS.hasChildNamed(App.folder, name)) name = _dedupName(App.folder, name);
             await deepCopy(id, App.folder, name !== n.name ? name : undefined);
+            _pastedSn = name;
         }
     }
     if (op === 'cut') App.clipboard = null;
@@ -519,9 +541,13 @@ async function pasteItems() {
     // Refresh all open views so both source and target folders update
     Desktop._patchIcons();
     if (typeof WinManager !== 'undefined') WinManager.renderAll();
+    const _destName = VFS.node(App.folder)?.name || 'Desktop';
+    const _pastedFp = ids.length === 1 && _pastedSn ? VFS.fullPath(App.folder) : null;
+    logActivity('paste', ids.length === 1 ? `${_pastedSn ?? VFS.node(ids[0])?.name ?? '1 item'} → ${_destName}` : `${ids.length} items → ${_destName}`, ids.length, _pastedFp && _pastedFp !== '/' ? _pastedFp + '/' + _pastedSn : null);
 }
 
-async function deepCopy(nodeId, newParent, newName) {
+async function deepCopy(nodeId, newParent, newName, _depth = 0) {
+    if (_depth > 64 || nodeId === 'root') return;
     const n = VFS.node(nodeId); if (!n) return;
     const newId = uid();
     const name = newName || n.name;
@@ -531,7 +557,7 @@ async function deepCopy(nodeId, newParent, newName) {
         if (rec) await DB.saveFile({ ...rec, id: newId, cid: App.container.id });
     } else {
         VFS.add({ ...n, id: newId, name, parentId: newParent, ctime: Date.now(), mtime: Date.now() });
-        for (const child of VFS.children(nodeId)) await deepCopy(child.id, newId);
+        for (const child of VFS.children(nodeId)) await deepCopy(child.id, newId, undefined, _depth + 1);
     }
 }
 
@@ -545,7 +571,8 @@ function selectAll() {
         const el = document.querySelector(`.file-item[data-id="${n.id}"]`);
         if (el) el.classList.add('selected');
     });
-    if (typeof Desktop !== 'undefined') Desktop._updateSelectionBar();
+    if (App._winCtx) App._winCtx._updateStatus();
+    else if (typeof Desktop !== 'undefined') Desktop._updateSelectionBar();
 }
 
 function sortIcons(by = 'name', dir = 'asc', winCtx = null) {
@@ -567,13 +594,13 @@ function sortIcons(by = 'name', dir = 'asc', winCtx = null) {
         return dir === 'desc' ? -cmp : cmp;
     });
     // Compute sequential grid positions directly (don't use autoPos which sees old positions as occupied)
-    const W = (area && area.clientWidth) || 800;
-    const cols = Math.max(1, Math.floor((W - 16) / GRID_X));
+    const W = (area && area.clientWidth) || 800,
+        cols = Math.max(1, Math.floor((W - 16) / GRID_X));
     items.forEach((n, i) => {
         const col = i % cols, row = Math.floor(i / cols);
         const x = 8 + col * GRID_X, y = 8 + row * GRID_Y;
         VFS.setPos(fid, n.id, x, y);
-        const el = area.querySelector(`.file-item[data-id="${n.id}"]`);
+        const el = area._iconMap?.get(n.id) ?? area.querySelector(`.file-item[data-id="${n.id}"]`);
         if (el) {
             el.style.transition = 'left 0.12s ease, top 0.12s ease';
             el.style.left = x + 'px'; el.style.top = y + 'px';
@@ -581,6 +608,7 @@ function sortIcons(by = 'name', dir = 'asc', winCtx = null) {
         }
     });
     saveVFS();
+    logActivity('sort', `by ${by} (${dir})`);
 }
 
 /* ============================================================
@@ -644,10 +672,12 @@ async function openFileAsText(node) {
 /* ============================================================
    FOLDER SIZE  (recursive sum of all file descendants)
    ============================================================ */
-function _folderSize(folderId) {
+function _folderSize(folderId, _visited = new Set()) {
+    if (_visited.has(folderId)) return 0;
+    _visited.add(folderId);
     let size = 0;
     VFS.children(folderId).forEach(n => {
-        size += n.type === 'file' ? (n.size || 0) : _folderSize(n.id);
+        size += n.type === 'file' ? (n.size || 0) : _folderSize(n.id, _visited);
     });
     return size;
 }
@@ -705,6 +735,34 @@ function openEditor(node, buf) {
         mod.style.display = ta.value !== _editorOriginal ? '' : 'none';
     };
     ta.oninput();
+    // Custom context menu for text editor (works on desktop + mobile)
+    ta.oncontextmenu = e => {
+        e.preventDefault();
+        const hasSel = ta.selectionStart !== ta.selectionEnd;
+        const _undoIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 6l-2 2 2 2" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" stroke-linejoin="miter"/><path d="M1 8h9a4 4 0 000-8" stroke="currentColor" stroke-width="1.4"/></svg>';
+        const _redoIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13 6l2 2-2 2" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" stroke-linejoin="miter"/><path d="M15 8H6a4 4 0 010-8" stroke="currentColor" stroke-width="1.4"/></svg>';
+        const _selAllIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1" stroke="currentColor" stroke-width="1.4"/><path d="M5 8h6M5 5.5h6M5 10.5h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="square"/></svg>';
+        showCtxMenu(e.clientX || e.pageX, e.clientY || e.pageY, [
+            { label: 'Undo', icon: _undoIcon, action: () => { ta.focus(); document.execCommand('undo'); if (ta.oninput) ta.oninput(); } },
+            { label: 'Redo', icon: _redoIcon, action: () => { ta.focus(); document.execCommand('redo'); if (ta.oninput) ta.oninput(); } },
+            { sep: true },
+            { label: 'Cut', icon: Icons.cut, action: () => { ta.focus(); document.execCommand('cut'); if (ta.oninput) ta.oninput(); }, disabled: !hasSel },
+            { label: 'Copy', icon: Icons.copy, action: () => { ta.focus(); document.execCommand('copy'); }, disabled: !hasSel },
+            {
+                label: 'Paste', icon: Icons.paste, action: async () => {
+                    ta.focus();
+                    try {
+                        const txt = await navigator.clipboard.readText();
+                        const ss = ta.selectionStart, se = ta.selectionEnd;
+                        ta.setRangeText(txt, ss, se, 'end');
+                        if (ta.oninput) ta.oninput();
+                    } catch (_) { /* clipboard read may be blocked by browser */ }
+                }
+            },
+            { sep: true },
+            { label: 'Select All', icon: _selAllIcon, action: () => { ta.focus(); ta.select(); } }
+        ]);
+    };
     Overlay.show('modal-editor');
     setTimeout(() => ta.focus(), 100);
 }
@@ -734,6 +792,7 @@ async function saveEditor() {
         await saveVFS();
         Desktop._patchIcons();
         toast('File saved', 'success');
+        logActivity('edit', _editorNode.name, 1, VFS.fullPath(_editorNode.id));
         saved = true;
     } catch (e) { toast('Save failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
@@ -770,8 +829,8 @@ let _viewerBlob = null;
 function openViewer(node, buf, mime) {
     const content = document.getElementById('viewer-content');
     content.innerHTML = '';
-    const blobObj = new Blob([buf], { type: mime });
-    const url = URL.createObjectURL(blobObj);
+    const blobObj = new Blob([buf], { type: mime }),
+        url = URL.createObjectURL(blobObj);
     _viewerBlob = { url, node };
 
     document.getElementById('viewer-title').textContent = node.name;
@@ -989,22 +1048,22 @@ function _readZip(buffer) {
         if (view.getUint32(i, true) === 0x06054b50) { eocdOffset = i; break; }
     }
     if (eocdOffset < 0) throw new Error('Not a valid ZIP file');
-    const cdCount = view.getUint16(eocdOffset + 8, true);
-    const cdOffset = view.getUint32(eocdOffset + 16, true);
-    const dec = new TextDecoder('utf-8');
-    const entries = {};
+    const cdCount = view.getUint16(eocdOffset + 8, true),
+        cdOffset = view.getUint32(eocdOffset + 16, true),
+        dec = new TextDecoder('utf-8'),
+        entries = {};
     let pos = cdOffset;
     for (let i = 0; i < cdCount; i++) {
         if (view.getUint32(pos, true) !== 0x02014b50) break;
-        const fnLen = view.getUint16(pos + 28, true);
-        const exLen = view.getUint16(pos + 30, true);
-        const cmLen = view.getUint16(pos + 32, true);
-        const lhOff = view.getUint32(pos + 42, true);
-        const fn = dec.decode(u8.subarray(pos + 46, pos + 46 + fnLen));
-        const lhFnLen = view.getUint16(lhOff + 26, true);
-        const lhExLen = view.getUint16(lhOff + 28, true);
-        const dataOff = lhOff + 30 + lhFnLen + lhExLen;
-        const dataLen = view.getUint32(lhOff + 22, true);
+        const fnLen = view.getUint16(pos + 28, true),
+            exLen = view.getUint16(pos + 30, true),
+            cmLen = view.getUint16(pos + 32, true),
+            lhOff = view.getUint32(pos + 42, true),
+            fn = dec.decode(u8.subarray(pos + 46, pos + 46 + fnLen)),
+            lhFnLen = view.getUint16(lhOff + 26, true),
+            lhExLen = view.getUint16(lhOff + 28, true),
+            dataOff = lhOff + 30 + lhFnLen + lhExLen,
+            dataLen = view.getUint32(lhOff + 22, true);
         entries[fn] = u8.slice(dataOff, dataOff + dataLen);
         pos += 46 + fnLen + exLen + cmLen;
     }
@@ -1094,22 +1153,31 @@ async function exportAsZip(nodeIds, zipName) {
     }
     showLoading('Preparing ZIP…');
     try {
-        const entries = [];
-        async function collectFiles(nodeId, prefix) {
+        const entries = [], _zipSeen = new Set(), _flat = [];
+        function _collectFlat(nodeId, prefix, _depth = 0) {
+            if (_zipSeen.has(nodeId) || _depth > 64) return;
+            _zipSeen.add(nodeId);
             const n = VFS.node(nodeId); if (!n) return;
             if (n.type === 'folder') {
-                for (const c of VFS.children(nodeId)) await collectFiles(c.id, prefix + n.name + '/');
+                for (const c of VFS.children(nodeId)) _collectFlat(c.id, prefix + n.name + '/', _depth + 1);
             } else {
-                const rec = await DB.getFile(nodeId); if (!rec) return;
-                const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
-                entries.push({ name: prefix + n.name, data: new Uint8Array(buf), mtime: n.mtime || n.ctime });
+                _flat.push({ id: nodeId, name: prefix + n.name, mtime: n.mtime || n.ctime });
             }
         }
-        for (const id of nodeIds) await collectFiles(id, '');
+        for (const id of nodeIds) _collectFlat(id, '');
+        // Fetch all file records in one IDB transaction, then decrypt fully in parallel
+        const fileMap = await DB.getFilesByIds(_flat.map(f => f.id));
+        const decResults = await Promise.allSettled(_flat.map(async item => {
+            const rec = fileMap.get(item.id); if (!rec) return null;
+            const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
+            return { name: item.name, data: new Uint8Array(buf), mtime: item.mtime };
+        }));
+        decResults.forEach(r => { if (r.status === 'fulfilled' && r.value) entries.push(r.value); });
         if (!entries.length) { toast('Nothing to export', 'warn'); hideLoading(); return; }
         const zip = _buildZip(entries);
         downloadBuf(zip.buffer, zipName, 'application/zip');
         toast(`Exported ${entries.length} file${entries.length !== 1 ? 's' : ''} as ZIP`, 'success');
+        logActivity('export-zip', nodeIds.length === 1 ? (VFS.node(nodeIds[0])?.name ?? entries[0]?.name ?? '1 file') : `${entries.length} files`, entries.length, nodeIds.length === 1 ? VFS.fullPath(nodeIds[0]) : null);
     } catch (e) { toast('ZIP export failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
 }
@@ -1118,44 +1186,62 @@ async function exportAsZip(nodeIds, zipName) {
    CONTAINER IMPORT / EXPORT
    ============================================================ */
 
-// Safe base64 for large ArrayBuffers (avoids stack overflow from spread)
-function _buf2b64Safe(buf) {
-    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    let str = '', CHUNK = 8192;
-    for (let i = 0; i < u8.length; i += CHUNK)
-        str += String.fromCharCode(...u8.subarray(i, Math.min(i + CHUNK, u8.length)));
-    return btoa(str);
-}
+// _buf2b64Safe removed — buf2b64 is now chunked and equivalent
+
+/** Brute-force attempt tracker for export password prompts */
+const _expFailCounts = new Map();
 
 /** Prompt for password to derive the container key before exporting a locked container */
 function _askExportPassword(c) {
     return new Promise(resolve => {
+        const expKey = 'exp:' + c.id;
+        const errEl = document.getElementById('exp-error');
+        const btnOk = document.getElementById('exp-ok');
         document.getElementById('exp-cont-name').textContent = c.name;
         document.getElementById('exp-pw').value = '';
-        document.getElementById('exp-error').textContent = '';
-        document.getElementById('exp-ok').disabled = false;
+        errEl.innerHTML = '';
+        errEl.style.color = '';
+        btnOk.disabled = false;
+
+        const prevFails = _expFailCounts.get(expKey);
+        if (prevFails?.lockUntil > Date.now()) {
+            _startAttemptCooldown(errEl, btnOk, () => { if (prevFails) prevFails.lockUntil = 0; });
+        }
+
         Overlay.show('modal-export-pw');
         setTimeout(() => document.getElementById('exp-pw').focus(), 100);
 
         const cleanup = () => {
             Overlay.hide();
-            document.getElementById('exp-ok').onclick = null;
+            btnOk.onclick = null;
             document.getElementById('exp-cancel').onclick = null;
             document.getElementById('exp-close').onclick = null;
             document.getElementById('exp-pw').onkeydown = null;
         };
 
         const doExport = async () => {
+            const fails = _expFailCounts.get(expKey) || { count: 0, lockUntil: 0 };
+            if (fails.lockUntil > Date.now()) return;
             const pw = document.getElementById('exp-pw').value;
-            const errEl = document.getElementById('exp-error');
-            if (!pw) { errEl.textContent = 'Enter password'; return; }
-            errEl.textContent = '';
-            const btnOk = document.getElementById('exp-ok');
+            if (!pw) { errEl.innerHTML = _ERR_SVG + ' Enter password'; return; }
+            errEl.innerHTML = '';
             btnOk.disabled = true;
             try {
-                const key = await Crypto.deriveKey(pw, new Uint8Array(c.salt));
-                const ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
-                if (!ok) { errEl.textContent = 'Incorrect password'; btnOk.disabled = false; return; }
+                const key = await Crypto.deriveKey(pw, new Uint8Array(c.salt)),
+                    ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
+                if (!ok) {
+                    fails.count++;
+                    _expFailCounts.set(expKey, fails);
+                    if (fails.count > 3) {
+                        fails.lockUntil = Date.now() + 3000;
+                        _startAttemptCooldown(errEl, btnOk, () => { fails.lockUntil = 0; });
+                    } else {
+                        errEl.innerHTML = _ERR_SVG + ' Incorrect password';
+                        btnOk.disabled = false;
+                    }
+                    return;
+                }
+                _expFailCounts.delete(expKey);
                 cleanup();
                 resolve(key);
             } catch (e) {
@@ -1164,57 +1250,68 @@ function _askExportPassword(c) {
             }
         };
 
-        document.getElementById('exp-ok').onclick = doExport;
+        btnOk.onclick = doExport;
         document.getElementById('exp-cancel').onclick = () => { cleanup(); resolve(null); };
         document.getElementById('exp-close').onclick = () => { cleanup(); resolve(null); };
         document.getElementById('exp-pw').onkeydown = e => { if (e.key === 'Enter') doExport(); };
     });
 }
 
-async function exportContainerFile(c) {
+async function exportContainerFile(c, requirePassword = true) {
     showLoading('Exporting container…');
     try {
-        const vfsRec = await DB.getVFS(c.id);
-        const fileRecs = await DB.getFilesByCid(c.id);
-        const now = Date.now();
+        const vfsRec = await DB.getVFS(c.id),
+            fileRecs = await DB.getFilesByCid(c.id),
+            now = Date.now();
 
         // Build file manifest and workspace.bin
-        const blobParts = [];
+        // Pre-convert blobs once, compute total size in a single pass
+        const fileChunks = fileRecs.map(f => new Uint8Array(f.blob instanceof ArrayBuffer ? f.blob : f.blob));
         let offset = 0;
-        const fileManifest = fileRecs.map(f => {
-            const data = new Uint8Array(f.blob instanceof ArrayBuffer ? f.blob : f.blob);
-            const ivB64 = btoa(String.fromCharCode(...new Uint8Array(f.iv instanceof Array ? f.iv : f.iv)));
-            const entry = { id: f.id, ivB64, offset, size: data.length };
-            blobParts.push(data);
-            offset += data.length;
+        const fileManifest = fileRecs.map((f, fi) => {
+            const ivArr = f.iv instanceof Array ? f.iv : Array.from(new Uint8Array(f.iv));
+            const ivB64 = btoa(String.fromCharCode(...ivArr));
+            const entry = { id: f.id, ivB64, offset, size: fileChunks[fi].length };
+            offset += fileChunks[fi].length;
             return entry;
         });
 
-        // Concat all file blobs → safenova_efs/workspace.bin
+        // Concat all file blobs → safenova_efs/workspace.bin (single allocation + typed set)
         const workspaceBin = new Uint8Array(offset);
         let wOff = 0;
-        for (const part of blobParts) { workspaceBin.set(part, wOff); wOff += part.length; }
+        for (const chunk of fileChunks) { workspaceBin.set(chunk, wOff); wOff += chunk.length; }
 
         // Encrypt file manifest with the container key
         const manifestJson = JSON.stringify(fileManifest);
         let key = (App.container?.id === c.id) ? App.key : null;
+        // If the extra-confirmation setting is off, silently try the saved session
+        if (!requirePassword && !key) {
+            const rawKeyBytes = await loadSession(c.id);
+            if (rawKeyBytes) {
+                try {
+                    const sk = await Crypto.importRawKey(rawKeyBytes);
+                    if (await Crypto.checkVerification(sk, c.verIv, c.verBlob)) key = sk;
+                } catch { /* corrupt session — will prompt below */ }
+            }
+        }
         if (!key) {
             hideLoading();
             key = await _askExportPassword(c);
             if (!key) return;
-            showLoading('Exporting container\u2026');
+            showLoading('Exporting container…');
         }
-        const encManifest = await Crypto.encrypt(key, manifestJson);
-        const encManifestIv = new Uint8Array(encManifest.iv);
-        const encManifestBlob = new Uint8Array(b642buf(encManifest.blob));
+        const encManifest = await Crypto.encryptBin(key, new TextEncoder().encode(manifestJson)),
+            encManifestIv = new Uint8Array(encManifest.iv),
+            encManifestBlob = new Uint8Array(encManifest.blob);
 
         // VFS bytes → meta/0 (iv raw), meta/1 (blob raw)
-        const vfsIvData = vfsRec ? new Uint8Array(vfsRec.iv) : new Uint8Array(0);
-        const vfsBlobData = vfsRec ? new Uint8Array(b642buf(vfsRec.blob)) : new Uint8Array(0);
+        const vfsIvData = vfsRec ? new Uint8Array(vfsRec.iv) : new Uint8Array(0),
+            vfsBlobData = vfsRec ? new Uint8Array(typeof vfsRec.blob === 'string' ? b642buf(vfsRec.blob) : vfsRec.blob) : new Uint8Array(0);
 
         // container.xml — file manifest is encrypted, no <files> in plaintext
-        const saltB64 = btoa(String.fromCharCode(...new Uint8Array(c.salt)));
-        const verIvB64 = btoa(String.fromCharCode(...new Uint8Array(c.verIv)));
+        const saltB64 = btoa(String.fromCharCode(...new Uint8Array(c.salt))),
+            verIvB64 = btoa(String.fromCharCode(...new Uint8Array(c.verIv)));
+        const settingsToExport = { ...SETTINGS_DEFAULTS, ...(c.settings || {}) };
         const xmlLines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             `<safenova version="3" exportedAt="${now}">`,
@@ -1226,6 +1323,9 @@ async function exportContainerFile(c) {
             `    <verBlob>${c.verBlob}</verBlob>`,
             `    <totalSize>${c.totalSize || 0}</totalSize>`,
             '  </container>',
+            '  <settings>',
+            ...Object.entries(settingsToExport).map(([k, v]) => `    <${k}>${_escXml(String(v))}</${k}>`),
+            '  </settings>',
             '  <files encrypted="true"/>',
             '</safenova>',
         ];
@@ -1239,50 +1339,76 @@ async function exportContainerFile(c) {
             { name: 'meta/3', data: encManifestBlob, mtime: now },
             { name: 'safenova_efs/workspace.bin', data: workspaceBin, mtime: now },
         ];
+        // Optionally include activity log (encrypted)
+        if (c.settings?.exportWithLogs === true) {
+            let alogEnc;
+            if (App.container?.id === c.id && typeof _activityLog !== 'undefined' && _activityLog.length) {
+                const compressed = await _compressLog(_activityLog);
+                alogEnc = await Crypto.encrypt(App.key, compressed);
+            } else if (c._alogZ && c._alogZ.iv && c._alogZ.blob) {
+                alogEnc = c._alogZ;
+            }
+            if (alogEnc) {
+                const alogBytes = new TextEncoder().encode(JSON.stringify(alogEnc));
+                entries.push({ name: 'meta/activity_logs/0', data: alogBytes, mtime: now });
+            }
+        }
         const zip = _buildZip(entries);
         const dateStr = new Date(now).toISOString().slice(0, 10);
         downloadBuf(zip.buffer, `SafeNova_${c.name}_${dateStr}.safenova`, 'application/octet-stream');
         toast(`Container "${c.name}" exported`, 'success');
+        logActivity('export-container', c.name);
     } catch (e) { toast('Export failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
 }
 
 async function importContainerFile(file) {
     if (!file) return;
+    const MAX_IMPORT_SIZE = 256 * 1024 * 1024; // 256 MB hard cap
+    if (file.size > MAX_IMPORT_SIZE) {
+        toast(`Import file too large (max ${fmtSize(MAX_IMPORT_SIZE)})`, 'error');
+        return;
+    }
     showLoading('Importing container…');
     try {
-        const arrayBuf = await file.arrayBuffer();
-        const u8first = new Uint8Array(arrayBuf, 0, 2);
-        const isZip = u8first[0] === 0x50 && u8first[1] === 0x4B;
+        const arrayBuf = await file.arrayBuffer(),
+            u8first = new Uint8Array(arrayBuf, 0, 2),
+            isZip = u8first[0] === 0x50 && u8first[1] === 0x4B;
 
         if (isZip) {
             const entries = _readZip(arrayBuf);
             if (!entries['container.xml'] || !entries['meta/0'] || !entries['meta/1'] || !entries['safenova_efs/workspace.bin'])
                 throw new Error('Invalid SafeNova file: missing required entries');
 
-            const xmlText = new TextDecoder('utf-8').decode(entries['container.xml']);
-            const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+            const xmlText = new TextDecoder('utf-8').decode(entries['container.xml']),
+                doc = new DOMParser().parseFromString(xmlText, 'text/xml');
             const getText = (parent, sel) => { const el = parent.querySelector(sel); return el ? el.textContent.trim() : null; };
 
-            const nameRaw = getText(doc, 'container > name');
-            const createdAt = parseInt(getText(doc, 'container > createdAt') || '0', 10);
-            const saltB64 = getText(doc, 'container > salt');
-            const verIvB64 = getText(doc, 'container > verIv');
-            const verBlob = getText(doc, 'container > verBlob');
-            const totalSize = parseInt(getText(doc, 'container > totalSize') || '0', 10);
+            const nameRaw = getText(doc, 'container > name'),
+                createdAt = parseInt(getText(doc, 'container > createdAt') || '0', 10),
+                saltB64 = getText(doc, 'container > salt'),
+                verIvB64 = getText(doc, 'container > verIv'),
+                verBlob = getText(doc, 'container > verBlob'),
+                totalSize = parseInt(getText(doc, 'container > totalSize') || '0', 10);
 
             if (!nameRaw || !saltB64 || !verIvB64 || !verBlob)
                 throw new Error('Invalid container.xml: missing required fields');
 
-            const salt = Array.from(Uint8Array.from(atob(saltB64), ch => ch.charCodeAt(0)));
-            const verIv = Array.from(Uint8Array.from(atob(verIvB64), ch => ch.charCodeAt(0)));
+            // Parse settings block if present
+            const settingsEl = doc.querySelector('settings');
+            let importedSettings;
+            if (settingsEl) {
+                importedSettings = {};
+                Array.from(settingsEl.children).forEach(el => {
+                    const v = el.textContent.trim();
+                    importedSettings[el.tagName] = v === 'true' ? true : v === 'false' ? false : v;
+                });
+            }
 
-            // Detect format version — v3 has encrypted file manifest
-            const filesEl = doc.querySelector('files');
-            const isV3 = filesEl && filesEl.getAttribute('encrypted') === 'true';
-            const versionStr = doc.querySelector('safenova')?.getAttribute('version');
+            const salt = Array.from(Uint8Array.from(atob(saltB64), ch => ch.charCodeAt(0))),
+                verIv = Array.from(Uint8Array.from(atob(verIvB64), ch => ch.charCodeAt(0)));
 
-            if (isV3 && entries['meta/2'] && entries['meta/3']) {
+            if (entries['meta/2'] && entries['meta/3']) {
                 // v3: import without password — encrypted workspace stored as-is, expanded on first unlock
                 const existing2 = await DB.getContainers();
                 let name = nameRaw, suffix = 2;
@@ -1290,59 +1416,31 @@ async function importContainerFile(file) {
                     name = nameRaw + ' (' + suffix++ + ')';
 
                 const newCid = uid();
-                await DB.saveContainer({
+                const cObj = {
                     id: newCid, name, createdAt, salt, verIv, verBlob, totalSize,
+                    settings: importedSettings || undefined,
                     lazyWorkspace: {
                         bin: entries['safenova_efs/workspace.bin'],
                         mIv: entries['meta/2'],
                         mBlob: entries['meta/3'],
                     }
-                });
-                await DB.saveVFS(newCid, Array.from(entries['meta/0']), buf2b64(entries['meta/1']));
+                };
+                // Restore encrypted activity log (if present)
+                if (entries['meta/activity_logs/0']) {
+                    try { cObj._alogZ = JSON.parse(new TextDecoder().decode(entries['meta/activity_logs/0'])); } catch {}
+                } else if (entries['meta/activity_log.zlib']) {
+                    // Legacy: plain compressed bytes — store raw, will be encrypted on first flush
+                    cObj._alogZ = entries['meta/activity_log.zlib'];
+                }
+                await DB.saveContainer(cObj);
+                await DB.saveVFS(newCid, Array.from(entries['meta/0']), entries['meta/1'].buffer);
                 hideLoading();
                 toast(`Container "${name}" imported`, 'success');
                 await Home.render();
                 return;
             }
 
-            // v2 legacy: plaintext <files> in XML
-            const fileManifest = [...doc.querySelectorAll('files > file')].map(el => ({
-                id: el.getAttribute('id'),
-                ivB64: el.getAttribute('iv'),
-                offset: parseInt(el.getAttribute('offset'), 10),
-                size: parseInt(el.getAttribute('size'), 10),
-            }));
-
-            const existing = await DB.getContainers();
-            let name = nameRaw, suffix = 2;
-            while (existing.find(c => c.name.toLowerCase() === name.toLowerCase()))
-                name = nameRaw + ' (' + suffix++ + ')';
-
-            const vfsIvArr = Array.from(entries['meta/0']);
-            const vfsBlobB64 = buf2b64(entries['meta/1']);
-            const workspace = entries['safenova_efs/workspace.bin'];
-
-            const newCid = uid();
-            const newCont = { id: newCid, name, createdAt, salt, verIv, verBlob, totalSize };
-            const savedIds = [];
-            await DB.saveContainer(newCont);
-            await DB.saveVFS(newCid, vfsIvArr, vfsBlobB64);
-            try {
-                for (const m of fileManifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0)));
-                    const blob = workspace.slice(m.offset, m.offset + m.size).buffer;
-                    await DB.saveFile({ id: m.id, cid: newCid, iv, blob });
-                    savedIds.push(m.id);
-                }
-            } catch (saveErr) {
-                for (const fid of savedIds) { try { await DB.deleteFile(fid); } catch (_) { } }
-                try { await DB.deleteVFS(newCid); } catch (_) { }
-                try { await DB.deleteContainer(newCid); } catch (_) { }
-                throw new Error('Import rolled back: ' + saveErr.message);
-            }
-            hideLoading();
-            toast(`Container "${name}" imported`, 'success');
-            await Home.render();
+            throw new Error('Unsupported container format. Only SafeNova v3 (.safenova) exports are supported.');
 
         } else {
             throw new Error('Unsupported file format. Please use a .safenova export.');
@@ -1352,62 +1450,6 @@ async function importContainerFile(file) {
         toast('Import failed: ' + e.message, 'error');
         console.error(e);
     }
-}
-
-/** Prompt user for password to decrypt encrypted file manifest (v3 format) */
-function _askImportPassword(containerName, salt, verIv, verBlob, zipEntries) {
-    return new Promise(resolve => {
-        document.getElementById('imp-name').textContent = containerName;
-        document.getElementById('imp-pw').value = '';
-        document.getElementById('imp-error').innerHTML = '';
-        Overlay.show('modal-import-pw');
-        setTimeout(() => document.getElementById('imp-pw').focus(), 100);
-
-        const cleanup = () => {
-            Overlay.hide();
-            btnOk.onclick = null;
-            btnCancel.onclick = null;
-            btnClose.onclick = null;
-            pwInput.onkeydown = null;
-        };
-
-        const btnOk = document.getElementById('imp-ok');
-        const btnCancel = document.getElementById('imp-cancel');
-        const btnClose = document.getElementById('imp-close');
-        const pwInput = document.getElementById('imp-pw');
-        const errEl = document.getElementById('imp-error');
-
-        const doImport = async () => {
-            const pw = pwInput.value;
-            if (!pw) { errEl.textContent = 'Enter password'; return; }
-            errEl.textContent = '';
-            btnOk.disabled = true;
-            try {
-                const key = await Crypto.deriveKey(pw, new Uint8Array(salt));
-                const ok = await Crypto.checkVerification(key, verIv, verBlob);
-                if (!ok) {
-                    errEl.textContent = 'Incorrect password';
-                    btnOk.disabled = false;
-                    return;
-                }
-                // Decrypt file manifest from meta/2 (iv) + meta/3 (blob)
-                const mIv = Array.from(zipEntries['meta/2']);
-                const mBlob = buf2b64(zipEntries['meta/3']);
-                const decBuf = await Crypto.decrypt(key, mIv, mBlob);
-                const manifest = JSON.parse(new TextDecoder().decode(decBuf));
-                cleanup();
-                resolve(manifest);
-            } catch (e) {
-                errEl.textContent = 'Decryption failed: ' + e.message;
-                btnOk.disabled = false;
-            }
-        };
-
-        btnOk.onclick = doImport;
-        btnCancel.onclick = () => { cleanup(); resolve(null); };
-        btnClose.onclick = () => { cleanup(); resolve(null); };
-        pwInput.onkeydown = e => { if (e.key === 'Enter') doImport(); };
-    });
 }
 
 /* ============================================================
@@ -1421,16 +1463,17 @@ async function generateThumb(node) {
         const mime = node.mime || getMime(node.name);
         if (!isImage(mime)) return null;
 
-        const blob = new Blob([buf], { type: mime });
-        const url = URL.createObjectURL(blob);
+        const blob = new Blob([buf], { type: mime }),
+            url = URL.createObjectURL(blob);
         return new Promise(res => {
             const img = new Image();
             img.onload = () => {
                 const canvas = document.createElement('canvas');
                 canvas.width = canvas.height = 56;
                 const ctx = canvas.getContext('2d');
-                const scale = Math.min(56 / img.width, 56 / img.height);
-                const w = img.width * scale, h = img.height * scale;
+                const scale = Math.min(56 / img.width, 56 / img.height),
+                    w = img.width * scale,
+                    h = img.height * scale;
                 ctx.fillStyle = '#2d2d30'; ctx.fillRect(0, 0, 56, 56);
                 ctx.drawImage(img, (56 - w) / 2, (56 - h) / 2, w, h);
                 URL.revokeObjectURL(url);
