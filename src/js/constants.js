@@ -185,6 +185,9 @@ const FOLDER_COLORS = [
     { label: 'Pink', color: '#e879a0' },
     { label: 'Yellow', color: '#d4b030' },
     { label: 'Grey', color: '#7a7a7a' },
+    { label: 'Cyan', color: '#00bcd4' },
+    { label: 'Magenta', color: '#ff00ff'},
+    { label: 'Dark Red', color: '#8b0000' },
 ];
 
 /* ============================================================
