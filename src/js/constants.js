@@ -256,7 +256,7 @@ function getFileIconSVG(mime, name) {
         return _bigIcon('#d4d4d4', _textPath());
     }
     if (['zip', 'rar', 'gz', '7z', 'tar', 'stk', 'itk', 'ltk', 'jtk', 'arj', 'deb', 'iso', 'cso', 'rpm', 'pkg'].includes(ext)) return _bigIcon('#ce9178', _archivePath());
-    if (['doc', 'docx', 'odt', 'rtf', 'md'].includes(ext)) return _bigIcon('#569cd6', _docPath());
+    if (['doc', 'docx', 'odt', 'rtf'].includes(ext)) return _bigIcon('#569cd6', _docPath());
     if (['xls', 'xlsx', 'xlsb', 'xlsm', 'ods'].includes(ext)) return _bigIcon('#4ec9b0', _dataPath());
     if (['ppt', 'pptx', 'odp'].includes(ext)) return _bigIcon('#ce9178', _slidePath());
     // Unknown type — show extension label inside icon (≤ 4 chars only)
