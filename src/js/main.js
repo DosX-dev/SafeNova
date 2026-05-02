@@ -395,10 +395,26 @@ window.addEventListener('snv:lock', e => {
         // Without the upper bound an attacker (Self-XSS / extension) can dispatch
         // snv:alive with n = Number.MAX_SAFE_INTEGER, permanently advancing _lastHbN
         // so all real daemon ticks (n=1,2,3…) are rejected → forced lockout in 3 s.
-        // At three mechanisms × ~1 tick/s = ~3 ticks/s, a delta of 15 covers ≥ 5 s
-        // of genuine ticks, so no false positives from timer jitter.
+        //
+        // The +15 bound was sized for "three slow mechanisms × ~1 tick/s = ~3 ticks/s"
+        // (mechanisms 2/3/4). Mechanism 1 (setInterval 50 ms = 20 ticks/s) was added
+        // later, bringing the real rate to ~23 ticks/s. At that rate, +15 covers only
+        // ~650 ms of startup gap — far too small for a fresh browser session where the
+        // ~485 KB of bottom-of-body scripts must be fetched over the network. During
+        // those network fetches the main thread is idle and the daemon's 50 ms
+        // setInterval fires freely, pushing _heartbeatN past 15 before this listener
+        // is registered. Every subsequent real heartbeat then fails n <= _lastHbN + 15,
+        // _lastAlive is never refreshed, and the DMS fires 3 s after unlock.
+        //
+        // Fix (bootstrap exemption): on the very first accepted event (_lastHbN === 0)
+        // skip the upper-bound check entirely — any n > 0 is accepted. The daemon is
+        // the only source of snv:alive events with a monotonically increasing counter,
+        // so the first event is always genuine. After this single bootstrap event the
+        // strict +15 window is restored, preserving the security guarantee that a
+        // post-load fake-n jump > 15 cannot permanently silence the real heartbeat.
         const n = e?.detail?.n;
-        if (typeof n === 'number' && n > _lastHbN && n <= _lastHbN + 15) {
+        const isBootstrap = (_lastHbN === 0);
+        if (typeof n === 'number' && n > _lastHbN && (isBootstrap || n <= _lastHbN + 15)) {
             _lastHbN = n;
             _lastAlive = Date.now();
         }
