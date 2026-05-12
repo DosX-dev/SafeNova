@@ -228,9 +228,23 @@
         let r = '';
         const len = s.length;
         let i = 0;
+        // FIX-QUO: track whether we are inside a quoted attribute value so that
+        // '=' characters and surrounding spaces WITHIN a value (e.g. '?w=10&h = 5')
+        // are not collapsed.  Without this, URLs with ' = ' inside their query
+        // string are silently mutated, corrupting the URL shown in alert messages.
+        // 0 = outside quotes, 34 = inside "-quote, 39 = inside '-quote.
+        let inQuote = 0;
         while (i < len) {
             const c = s[i];
-            if (c === ' ' || c === '\t') {
+            if (inQuote !== 0) {
+                // Inside a quoted value — pass everything through unchanged.
+                if ((inQuote === 34 && c === '"') || (inQuote === 39 && c === "'")) inQuote = 0;
+                r += c; i++;
+            } else if (c === '"') {
+                inQuote = 34; r += c; i++;
+            } else if (c === "'") {
+                inQuote = 39; r += c; i++;
+            } else if (c === ' ' || c === '\t') {
                 // Peek ahead: if the first non-space char is '=', these are
                 // pre-'=' spaces — skip them entirely.
                 let j = i;
@@ -794,6 +808,17 @@
         cacheStorageKeys: (typeof CacheStorage !== 'undefined' && CacheStorage.prototype && typeof CacheStorage.prototype.keys === 'function') ? CacheStorage.prototype.keys : null,
         cacheStorageDelete: (typeof CacheStorage !== 'undefined' && CacheStorage.prototype && typeof CacheStorage.prototype.delete === 'function') ? CacheStorage.prototype.delete : null,
         swGetRegistrations: (typeof ServiceWorkerContainer !== 'undefined' && ServiceWorkerContainer.prototype && typeof ServiceWorkerContainer.prototype.getRegistrations === 'function') ? ServiceWorkerContainer.prototype.getRegistrations : null,
+
+        // Promise.prototype.then — used in _nukeCachesAndWorkers to chain async
+        // cache/SW wipe callbacks.  If an attacker replaces Promise.prototype.then
+        // after boot, the entire cache and SW wipe silently becomes a no-op.
+        // Must be validated native at both boot and on every tick.
+        promiseThen: Promise.prototype.then,
+
+        // ServiceWorkerRegistration.prototype.unregister — called per-registration
+        // in _nukeCachesAndWorkers.  Captured so a post-boot replacement of this
+        // prototype method cannot prevent SW unregistration during threat response.
+        swUnregister: (typeof ServiceWorkerRegistration !== 'undefined' && ServiceWorkerRegistration.prototype && typeof ServiceWorkerRegistration.prototype.unregister === 'function') ? ServiceWorkerRegistration.prototype.unregister : null,
     });
 
     /* ──────────────────────────────────────────────────────────
@@ -830,6 +855,8 @@
         _N.setAttribute, _N.getAttribute, _N.formSubmit,
         // Date.now — used for alert rate-limiting and healer deadline
         _N.dateNow,
+        // Promise.prototype.then — used for async cache/SW wipe callbacks
+        _N.promiseThen,
     ];
     // Constructors are native but toString prints differently — check them
     // with _isNative which already handles "function Uint8Array() { [native code] }"
@@ -854,6 +881,8 @@
     if (_N.swGetRegistrations) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.swGetRegistrations;
     // locationReload — optional (may be null in non-standard environments)
     if (_N.locationReload) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.locationReload;
+    // swUnregister — optional (absent in browsers without Service Worker support)
+    if (_N.swUnregister) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.swUnregister;
 
     // BUG-E: for...of relies on Array.prototype[Symbol.iterator]; replacing it
     // before daemon.js loads makes both loops iterate zero elements, so
@@ -1016,6 +1045,10 @@
     if (_N.cacheStorageKeys) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['CacheStorage.prototype.keys', () => (typeof CacheStorage !== 'undefined' ? CacheStorage.prototype.keys : _N.cacheStorageKeys)];
     if (_N.cacheStorageDelete) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['CacheStorage.prototype.delete', () => (typeof CacheStorage !== 'undefined' ? CacheStorage.prototype.delete : _N.cacheStorageDelete)];
     if (_N.swGetRegistrations) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['ServiceWorkerContainer.prototype.getRegistrations', () => (typeof ServiceWorkerContainer !== 'undefined' ? ServiceWorkerContainer.prototype.getRegistrations : _N.swGetRegistrations)];
+    // Promise.prototype.then — replacing it silently kills _nukeCachesAndWorkers
+    _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['Promise.prototype.then', () => Promise.prototype.then];
+    // ServiceWorkerRegistration.prototype.unregister — used per-registration in threat response
+    if (_N.swUnregister) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['ServiceWorkerRegistration.prototype.unregister', () => (typeof ServiceWorkerRegistration !== 'undefined' ? ServiceWorkerRegistration.prototype.unregister : _N.swUnregister)];
 
     /* ──────────────────────────────────────────────────────────
        3.  Threat response
@@ -1080,10 +1113,13 @@
     // cannot redirect these calls to fake objects.
     function _nukeCachesAndWorkers() {
         try {
-            if (_caches && _N.cacheStorageKeys) {
+            if (_caches && _N.cacheStorageKeys && _N.promiseThen) {
                 // BUG-I: indexed for-loops replace .forEach() — immune to
                 // Array.prototype.forEach replacement (same rationale as BUG-B/E).
-                _reflectApply(_N.cacheStorageKeys, _caches, []).then(keys => {
+                // FIX-PT: use captured _N.promiseThen instead of live .then() —
+                // a post-boot Promise.prototype.then replacement would otherwise
+                // turn this entire block into a silent no-op.
+                _reflectApply(_N.promiseThen, _reflectApply(_N.cacheStorageKeys, _caches, []), [keys => {
                     if (keys && keys.length) {
                         for (let _ki = 0; _ki < keys.length; _ki++) {
                             try {
@@ -1093,18 +1129,23 @@
                             } catch { }
                         }
                     }
-                }).catch(() => { });
+                }, () => { }]);
             }
         } catch { }
         try {
-            if (_sw && _N.swGetRegistrations) {
-                _reflectApply(_N.swGetRegistrations, _sw, []).then(regs => {
+            if (_sw && _N.swGetRegistrations && _N.promiseThen) {
+                // FIX-PT: same rationale — use captured promiseThen and swUnregister
+                // so post-boot prototype replacements cannot suppress SW cleanup.
+                _reflectApply(_N.promiseThen, _reflectApply(_N.swGetRegistrations, _sw, []), [regs => {
                     if (regs && regs.length) {
                         for (let _ri = 0; _ri < regs.length; _ri++) {
-                            try { regs[_ri].unregister(); } catch { }
+                            try {
+                                if (_N.swUnregister) _reflectApply(_N.swUnregister, regs[_ri], []);
+                                else regs[_ri].unregister();
+                            } catch { }
                         }
                     }
-                }).catch(() => { });
+                }, () => { }]);
             }
         } catch { }
     }
@@ -1270,7 +1311,11 @@
                 });
                 _alertHealer = _healer;
                 try {
-                    _healer.observe(document.body || document.documentElement, { childList: true, subtree: false });
+                    // FIX-BDY: observe documentElement (subtree:true) instead of
+                    // document.body — if an attacker replaces document.body after
+                    // render(), the old observer is on a detached node and never
+                    // fires again.  documentElement cannot be replaced from JS.
+                    _healer.observe(document.documentElement, { childList: true, subtree: true });
                 } catch { }
             }
         };
