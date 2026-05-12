@@ -819,6 +819,12 @@
         // in _nukeCachesAndWorkers.  Captured so a post-boot replacement of this
         // prototype method cannot prevent SW unregistration during threat response.
         swUnregister: (typeof ServiceWorkerRegistration !== 'undefined' && ServiceWorkerRegistration.prototype && typeof ServiceWorkerRegistration.prototype.unregister === 'function') ? ServiceWorkerRegistration.prototype.unregister : null,
+
+        // MessagePort.prototype.postMessage — used in the MessageChannel (mechanism 4)
+        // watchdog self-ping.  If an attacker replaces this after boot, the fourth
+        // watchdog mechanism silently dies; the other three remain active but the
+        // defence-in-depth guarantee is weakened.
+        portPostMessage: (typeof MessagePort !== 'undefined' && MessagePort.prototype && typeof MessagePort.prototype.postMessage === 'function') ? MessagePort.prototype.postMessage : null,
     });
 
     /* ──────────────────────────────────────────────────────────
@@ -858,6 +864,8 @@
         // Promise.prototype.then — used for async cache/SW wipe callbacks
         _N.promiseThen,
     ];
+    // MessagePort.prototype.postMessage — optional (absent in very old browsers)
+    if (_N.portPostMessage) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.portPostMessage;
     // Constructors are native but toString prints differently — check them
     // with _isNative which already handles "function Uint8Array() { [native code] }"
     const _CAPTURE_MUST_BE_NATIVE_CTORS = [
@@ -1049,6 +1057,8 @@
     _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['Promise.prototype.then', () => Promise.prototype.then];
     // ServiceWorkerRegistration.prototype.unregister — used per-registration in threat response
     if (_N.swUnregister) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['ServiceWorkerRegistration.prototype.unregister', () => (typeof ServiceWorkerRegistration !== 'undefined' ? ServiceWorkerRegistration.prototype.unregister : _N.swUnregister)];
+    // MessagePort.prototype.postMessage — used in the MC watchdog self-ping
+    if (_N.portPostMessage) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['MessagePort.prototype.postMessage', () => (typeof MessagePort !== 'undefined' ? MessagePort.prototype.postMessage : _N.portPostMessage)];
 
     /* ──────────────────────────────────────────────────────────
        3.  Threat response
@@ -1479,6 +1489,17 @@
         src: 1, href: 1, data: 1, ping: 1,
         srcset: 1, action: 1, formaction: 1, poster: 1
     };
+    // FIX-SS: srcset values contain space-separated URL+descriptor tokens
+    // (e.g. "photo.jpg 2x" or "img.jpg 320w"). Passing a raw srcset string
+    // to new URL() throws, making _isExternal return true (fail-closed) for
+    // every srcset — any extension that adds srcset causes a false alert and
+    // key wipe. srcset is kept in _RESOURCE_ATTRS so setAttribute/innerHTML
+    // hooks (which parse individual tokens) can still check it, but the MO
+    // attribute-change and element-scan paths skip it to avoid false positives.
+    const _RESOURCE_ATTRS_NO_SRCSET = {
+        src: 1, href: 1, data: 1, ping: 1,
+        action: 1, formaction: 1, poster: 1
+    };
     const _ON_ATTR_RE = /\bon[a-z]+\s*=/i;
 
     /* ──────────────────────────────────────────────────────────
@@ -1728,7 +1749,10 @@
                 return;
             }
             if (_isNavEl && aName === 'href') continue; // navigation-only, not a resource loader
-            if (aName in _RESOURCE_ATTRS) {
+            // FIX-SS: use _RESOURCE_ATTRS_NO_SRCSET — srcset values contain URL+descriptor tokens
+            // (e.g. "img.jpg 2x") that are not valid URLs; passing them to new URL() throws, so
+            // _isExternal returns true (fail-closed) for every srcset, causing false alerts.
+            if (aName in _RESOURCE_ATTRS_NO_SRCSET) {
                 const val = '' + (_a.value || '');
                 if (_isExternal(val)) {
                     try { _reflectApply(_N.removeAttribute, el, [aName]); } catch { }
@@ -2459,9 +2483,14 @@
             // tuned independently; if setTimeout was killed (all IDs in
             // _watchdogIds are expired) the MessageChannel still fires once
             // more and the dead man's switch in main.js covers the rest.
-            _reflectApply(_N._setTimeout, window, [() => { _mc.port1.postMessage(null); }, 800]);
+            // FIX-MP: use captured _N.portPostMessage so a post-boot replacement
+            // of MessagePort.prototype.postMessage cannot kill this mechanism.
+            const _pmFn = _N.portPostMessage || _mc.port1.postMessage.bind(_mc.port1);
+            _reflectApply(_N._setTimeout, window, [() => { _reflectApply(_pmFn, _mc.port1, [null]); }, 800]);
         };
-        _mc.port1.postMessage(null); // prime the first message
+        // FIX-MP: same rationale for the initial prime.
+        const _pmFn = _N.portPostMessage || _mc.port1.postMessage.bind(_mc.port1);
+        _reflectApply(_pmFn, _mc.port1, [null]); // prime the first message
     } catch { /* MessageChannel unavailable — three mechanisms still active */ }
 
     // ── B2: Guard clearInterval / clearTimeout ─────────────────
@@ -2706,7 +2735,8 @@
                             const _tgtTag = _pureToLower('' + (_tgt.tagName || ''));
                             if (_tgtTag === 'a' || _tgtTag === 'area') continue;
                         }
-                        if (_aName in _RESOURCE_ATTRS) {
+                        // FIX-SS: use _RESOURCE_ATTRS_NO_SRCSET — same reason as _scanElementForThreats
+                        if (_aName in _RESOURCE_ATTRS_NO_SRCSET) {
                             let _val;
                             try { _val = _reflectApply(_N.getAttribute, _tgt, [_aName]); } catch { continue; }
                             if (_isExternal('' + (_val || ''))) {
