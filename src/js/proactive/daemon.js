@@ -217,6 +217,37 @@
         return r;
     };
 
+    // _pureCollapseAttrSpaces(s) — removes ASCII spaces/tabs around '=' in HTML
+    // attribute assignments (e.g. 'src = "url"' → 'src="url"').
+    // Per the HTML5 tokenizer spec an attribute name may be separated from its
+    // value by optional whitespace around the '=' sign; without normalisation
+    // a search for the literal 'src=' misses 'src =' and 'src ='.
+    // Built entirely from bracket indexing, .length, comparison and concatenation —
+    // ZERO prototype method calls, immune to String.prototype poisoning.
+    const _pureCollapseAttrSpaces = s => {
+        let r = '';
+        const len = s.length;
+        let i = 0;
+        while (i < len) {
+            const c = s[i];
+            if (c === ' ' || c === '\t') {
+                // Peek ahead: if the first non-space char is '=', these are
+                // pre-'=' spaces — skip them entirely.
+                let j = i;
+                while (j < len && (s[j] === ' ' || s[j] === '\t')) j++;
+                if (j < len && s[j] === '=') { i = j; continue; }
+                r += c; i++;
+            } else if (c === '=') {
+                r += c; i++;
+                // Skip post-'=' spaces so value starts immediately after '='.
+                while (i < len && (s[i] === ' ' || s[i] === '\t')) i++;
+            } else {
+                r += c; i++;
+            }
+        }
+        return r;
+    };
+
     // Capture Function.prototype.toString before anyone can spoof it.
     // All subsequent "is this native?" checks use this reference directly.
     const _fnToString = Function.prototype.toString;
@@ -263,6 +294,12 @@
     // fooled by a getter-level interception.
     const _ls = (() => { try { return window.localStorage; } catch { return null; } })();
     const _ss = (() => { try { return window.sessionStorage; } catch { return null; } })();
+    // Early capture of CacheStorage and ServiceWorkerContainer instances —
+    // same rationale as _ls/_ss: if an attacker later replaces window.caches
+    // or navigator.serviceWorker via Object.defineProperty, _nukeCachesAndWorkers
+    // still operates on the real objects.
+    const _caches = (() => { try { return (typeof caches !== 'undefined' ? caches : null); } catch { return null; } })();
+    const _sw = (() => { try { return (navigator && navigator.serviceWorker ? navigator.serviceWorker : null); } catch { return null; } })();
 
     /* ──────────────────────────────────────────────────────────
        0b. Pre-existence guard-token check
@@ -741,6 +778,22 @@
 
         // UI — captured so our alert overlay cannot itself be intercepted
         alert: window.alert,
+
+        // Location reload — captured so an attacker replacing window.location.reload
+        // after daemon.js boots cannot prevent the post-alert page reload.
+        locationReload: Location.prototype.reload ?? null,
+
+        // Date.now — captured so rate-limiting (_ALERT_COOLDOWN_MS) and healer
+        // deadline cannot be bypassed by replacing Date.now after boot.
+        dateNow: Date.now,
+
+        // CacheStorage and ServiceWorkerContainer prototype methods — captured so
+        // _nukeCachesAndWorkers uses native methods even if the live globals are
+        // later replaced via Object.defineProperty.  Optional: may be null in
+        // environments that lack the Cache API or Service Worker support.
+        cacheStorageKeys: (typeof CacheStorage !== 'undefined' && CacheStorage.prototype && typeof CacheStorage.prototype.keys === 'function') ? CacheStorage.prototype.keys : null,
+        cacheStorageDelete: (typeof CacheStorage !== 'undefined' && CacheStorage.prototype && typeof CacheStorage.prototype.delete === 'function') ? CacheStorage.prototype.delete : null,
+        swGetRegistrations: (typeof ServiceWorkerContainer !== 'undefined' && ServiceWorkerContainer.prototype && typeof ServiceWorkerContainer.prototype.getRegistrations === 'function') ? ServiceWorkerContainer.prototype.getRegistrations : null,
     });
 
     /* ──────────────────────────────────────────────────────────
@@ -775,6 +828,8 @@
         _reTest, _freeze, _arrPush, _strSlice, _strToLower, _strIndexOf,
         // DOM exfiltration — core methods (D2)
         _N.setAttribute, _N.getAttribute, _N.formSubmit,
+        // Date.now — used for alert rate-limiting and healer deadline
+        _N.dateNow,
     ];
     // Constructors are native but toString prints differently — check them
     // with _isNative which already handles "function Uint8Array() { [native code] }"
@@ -793,6 +848,12 @@
     if (_N.locReplace) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.locReplace;
     if (_N.docWrite) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.docWrite;
     if (_N.docWriteln) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.docWriteln;
+    // CacheStorage / ServiceWorkerContainer methods — optional (absent in some browsers)
+    if (_N.cacheStorageKeys) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.cacheStorageKeys;
+    if (_N.cacheStorageDelete) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.cacheStorageDelete;
+    if (_N.swGetRegistrations) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.swGetRegistrations;
+    // locationReload — optional (may be null in non-standard environments)
+    if (_N.locationReload) _CAPTURE_MUST_BE_NATIVE[_CAPTURE_MUST_BE_NATIVE.length] = _N.locationReload;
 
     // BUG-E: for...of relies on Array.prototype[Symbol.iterator]; replacing it
     // before daemon.js loads makes both loops iterate zero elements, so
@@ -946,6 +1007,15 @@
     _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['Element.prototype.querySelectorAll', () => Element.prototype.querySelectorAll];
     // removeAttribute — used by MO observer and scanner to strip malicious attributes.
     _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['Element.prototype.removeAttribute', () => Element.prototype.removeAttribute];
+    // Date.now — used for alert rate-limiting and healer deadline; replacing it
+    // could suppress alerts or keep the healer alive indefinitely.
+    _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['Date.now', () => Date.now];
+    // Location.prototype.reload — used in the alert dismiss/reload button.
+    if (_N.locationReload) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['Location.prototype.reload', () => Location.prototype.reload];
+    // CacheStorage / ServiceWorkerContainer — optional; validate when present.
+    if (_N.cacheStorageKeys) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['CacheStorage.prototype.keys', () => (typeof CacheStorage !== 'undefined' ? CacheStorage.prototype.keys : _N.cacheStorageKeys)];
+    if (_N.cacheStorageDelete) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['CacheStorage.prototype.delete', () => (typeof CacheStorage !== 'undefined' ? CacheStorage.prototype.delete : _N.cacheStorageDelete)];
+    if (_N.swGetRegistrations) _NATIVE_CHECKS[_NATIVE_CHECKS.length] = ['ServiceWorkerContainer.prototype.getRegistrations', () => (typeof ServiceWorkerContainer !== 'undefined' ? ServiceWorkerContainer.prototype.getRegistrations : _N.swGetRegistrations)];
 
     /* ──────────────────────────────────────────────────────────
        3.  Threat response
@@ -1005,24 +1075,30 @@
     // If an attacker managed to run code (e.g. Self-XSS), they might spawn a
     // rogue Service Worker for persistence or stash data in the Cache API.
     // We unregister all SWs and delete all Cache API storage to guarantee a clean slate.
+    // Uses _caches/_sw (captured object refs, see section 0) and captured prototype
+    // methods from _N so live window.caches / navigator.serviceWorker replacements
+    // cannot redirect these calls to fake objects.
     function _nukeCachesAndWorkers() {
         try {
-            if (window.caches && caches.keys) {
-                // Ignore returned Promises to evade potential Promise poisoning and await hangs
+            if (_caches && _N.cacheStorageKeys) {
                 // BUG-I: indexed for-loops replace .forEach() — immune to
                 // Array.prototype.forEach replacement (same rationale as BUG-B/E).
-                caches.keys().then(keys => {
+                _reflectApply(_N.cacheStorageKeys, _caches, []).then(keys => {
                     if (keys && keys.length) {
                         for (let _ki = 0; _ki < keys.length; _ki++) {
-                            try { caches.delete(keys[_ki]); } catch { }
+                            try {
+                                if (_N.cacheStorageDelete) {
+                                    _reflectApply(_N.cacheStorageDelete, _caches, [keys[_ki]]);
+                                }
+                            } catch { }
                         }
                     }
                 }).catch(() => { });
             }
         } catch { }
         try {
-            if (navigator && navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
-                navigator.serviceWorker.getRegistrations().then(regs => {
+            if (_sw && _N.swGetRegistrations) {
+                _reflectApply(_N.swGetRegistrations, _sw, []).then(regs => {
                     if (regs && regs.length) {
                         for (let _ri = 0; _ri < regs.length; _ri++) {
                             try { regs[_ri].unregister(); } catch { }
@@ -1167,7 +1243,10 @@
             if (btn) {
                 btn.addEventListener('click', () => {
                     overlay.remove();
-                    window.location.reload();
+                    // Use captured Location.prototype.reload so an attacker who
+                    // replaces window.location.reload after boot cannot suppress reload.
+                    try { _reflectApply(_N.locationReload, window.location, []); }
+                    catch { window.location.reload(); }
                 }, { once: true });
             }
 
@@ -1176,13 +1255,13 @@
             // overlay.isConnected (reference-based) instead of getElementById so an
             // attacker removing the element but keeping a same-id decoy doesn't fool us.
             if (_N.MutationObserver) {
-                const _healDeadline = Date.now() + 180_000;
+                const _healDeadline = _reflectApply(_N.dateNow, Date, []) + 180_000;
                 const _healer = new _N.MutationObserver(() => {
                     // Bug 1c: Stale closure guard — if a newer render() has replaced
                     // _alertOverlay, this healer is orphaned. Disconnect immediately
                     // instead of trying to re-add an overlay that was intentionally removed.
                     if (overlay !== _alertOverlay) { _healer.disconnect(); return; }
-                    if (Date.now() > _healDeadline) { _healer.disconnect(); _alertHealer = null; return; }
+                    if (_reflectApply(_N.dateNow, Date, []) > _healDeadline) { _healer.disconnect(); _alertHealer = null; return; }
                     if (!overlay.isConnected) {
                         try { _reflectApply(_nodeAppend, document.body || document.documentElement, [overlay]); } catch { }
                     }
@@ -1199,7 +1278,9 @@
         if (document.body) {
             render();
         } else {
-            window.addEventListener('DOMContentLoaded', render, { once: true });
+            // CRIT-3: use captured _N.addEventListener so a live replacement cannot
+            // prevent the fallback render from firing.
+            _reflectApply(_N.addEventListener, window, ['DOMContentLoaded', render, { once: true }]);
         }
     }
 
@@ -1238,11 +1319,11 @@
     function _startDebuggerTrap() {
         if (_debugTrapActive) return;
         _debugTrapActive = true;
-        const _trapEnd = Date.now() + 300_000;
+        const _trapEnd = _reflectApply(_N.dateNow, Date, []) + 300_000;
         const _tidRef = { id: null };
         const _fire = function snvDebugTrap() {
             debugger; // intentional — Self-XSS deterrent // eslint-disable-line no-debugger
-            if (Date.now() > _trapEnd) {
+            if (_reflectApply(_N.dateNow, Date, []) > _trapEnd) {
                 _reflectApply(_N._clearInterval, window, [_tidRef.id]);
                 delete _trapIds[_tidRef.id]; // SET-2: delete operator
                 _debugTrapActive = false;
@@ -1276,7 +1357,7 @@
                 new _N.CustomEvent('snv:lock', { detail: { reason } })]);
         } catch { }
 
-        const now = Date.now();
+        const now = _reflectApply(_N.dateNow, Date, []);
         if (now - _lastAlertAt < _ALERT_COOLDOWN_MS) return;
         _lastAlertAt = now;
         _showAlert(reason);
@@ -1395,7 +1476,12 @@
         if (_pureIndexOf(h, '://') === -1) return false;
         const _RATTR_KEYS = ['src=', 'href=', 'data=', 'ping=', 'action=', 'formaction=', 'poster=', 'srcset='];
         // BUG-K: _pureToLower — pure operator-level ASCII lowercasing.
-        const hLow = _pureToLower(h);
+        // FIX-WS: _pureCollapseAttrSpaces normalises 'attr = "url"' → 'attr="url"'
+        // so that attributes with whitespace around '=' are not missed by the
+        // literal 'src=' search (HTML5 spec allows optional whitespace around '=').
+        // Both hLow and hOrig apply the same normalisation so their indices align.
+        const hLow = _pureCollapseAttrSpaces(_pureToLower(h));
+        const hOrig = _pureCollapseAttrSpaces(h);
         for (let _ri = 0; _ri < _RATTR_KEYS.length; _ri++) {
             const attr = _RATTR_KEYS[_ri];
             let apos = 0;
@@ -1403,19 +1489,21 @@
                 apos = _pureIndexOf(hLow, attr, apos);
                 if (apos === -1) break;
                 let vs = apos + attr.length;
-                while (vs < h.length && (h[vs] === ' ' || h[vs] === '\t')) vs++;
+                // After normalisation post-'=' spaces are already removed;
+                // the loop is kept as a no-op fallback for defence-in-depth.
+                while (vs < hOrig.length && (hOrig[vs] === ' ' || hOrig[vs] === '\t')) vs++;
                 let ve;
-                if (h[vs] === '"' || h[vs] === "'") {
-                    const q = h[vs]; vs++;
-                    ve = _pureIndexOf(h, q, vs);
-                    if (ve === -1) ve = h.length;
+                if (hOrig[vs] === '"' || hOrig[vs] === "'") {
+                    const q = hOrig[vs]; vs++;
+                    ve = _pureIndexOf(hOrig, q, vs);
+                    if (ve === -1) ve = hOrig.length;
                 } else {
                     ve = vs;
-                    while (ve < h.length && h[ve] !== ' ' && h[ve] !== '>' && h[ve] !== '\t') ve++;
+                    while (ve < hOrig.length && hOrig[ve] !== ' ' && hOrig[ve] !== '>' && hOrig[ve] !== '\t') ve++;
                 }
                 // BUG-L: _pureSlice extracts substring via bracket + concatenation —
                 // immune to any String.prototype.slice / .substring hook.
-                const url = _pureSlice(h, vs, ve);
+                const url = _pureSlice(hOrig, vs, ve);
                 if (_isExternal(url)) return attr + url;
                 apos = ve;
             }
@@ -1762,7 +1850,7 @@
                 try { if (a.container !== undefined) a.container = null; } catch { }
                 try { if (a.clipboard !== undefined) a.clipboard = null; } catch { }
                 try { if (a.thumbCache !== undefined) a.thumbCache = {}; } catch { }
-                try { if (a.selection instanceof Set) a.selection.clear(); } catch { }
+                try { if (a.selection && typeof a.selection.clear === 'function') a.selection.clear(); } catch { }
             }
         } catch { }
 
@@ -2320,7 +2408,7 @@
         const _mc = new MessageChannel();
         let _lastMcTick = 0;
         _mc.port2.onmessage = function _mcLoop() {
-            const _now = Date.now();
+            const _now = _reflectApply(_N.dateNow, Date, []);
             if (_now - _lastMcTick >= 800) { _lastMcTick = _now; _tick(); }
             // Re-schedule via a captured setTimeout so the interval can be
             // tuned independently; if setTimeout was killed (all IDs in
