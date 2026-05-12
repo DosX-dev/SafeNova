@@ -250,7 +250,12 @@ async function downloadFile(node) {
     try {
         const rec = await DB.getFile(node.id);
         if (!rec) { toast('File data not found', 'error'); hideLoading(); return; }
-        const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
+        let buf;
+        if (!rec.blob || (rec.blob instanceof ArrayBuffer && rec.blob.byteLength === 0)) {
+            buf = new ArrayBuffer(0);
+        } else {
+            buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
+        }
         downloadBuf(buf, node.name, node.mime || getMime(node.name));
         toast('Exported: ' + node.name, 'success');
         logActivity('download', node.name, 1, VFS.fullPath(node.id));

@@ -67,9 +67,14 @@ const DB = (() => {
                     const d = req.result?.data;
                     if (d) { parts[i] = d; totalSize += d.byteLength; }
                     if (--pending === 0) {
+                        // Reject if any chunk is missing — silently skipping a missing chunk
+                        // corrupts all subsequent offsets and produces garbled data.
+                        for (let k = 0; k < count; k++) {
+                            if (!parts[k]) { reject(new Error('Missing chunk ' + id + '_' + k)); return; }
+                        }
                         const merged = new Uint8Array(totalSize);
                         let off = 0;
-                        for (const p of parts) { if (p) { merged.set(new Uint8Array(p), off); off += p.byteLength; } }
+                        for (const p of parts) { merged.set(new Uint8Array(p), off); off += p.byteLength; }
                         rec.blob = merged.buffer;
                         delete rec._chunked;
                         resolve(rec);
@@ -126,7 +131,15 @@ const DB = (() => {
                     if (rec._chunked) {
                         // Large file: zero the IV — avoids reading any chunk data entirely.
                         // AES-GCM without a valid IV is unconditionally undecryptable.
-                        if (rec.iv) new Uint8Array(rec.iv instanceof ArrayBuffer ? rec.iv : rec.iv.buffer).fill(0);
+                        // rec.iv is stored as a plain JS Array (via Array.from()), not an ArrayBuffer,
+                        // so we must fill in-place rather than wrapping in a TypedArray view.
+                        if (Array.isArray(rec.iv)) {
+                            for (let _i = 0; _i < rec.iv.length; _i++) rec.iv[_i] = 0;
+                        } else if (rec.iv instanceof ArrayBuffer) {
+                            new Uint8Array(rec.iv).fill(0);
+                        } else if (ArrayBuffer.isView(rec.iv)) {
+                            new Uint8Array(rec.iv.buffer, rec.iv.byteOffset, rec.iv.byteLength).fill(0);
+                        }
                         fs.put(rec);
                     } else if (rec.blob) {
                         // Inline file: XOR-flip 2 random non-adjacent bytes in the ciphertext.
