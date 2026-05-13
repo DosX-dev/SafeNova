@@ -101,6 +101,7 @@ function isImage(mime) { return mime.startsWith('image/'); }
 function isAudio(mime) { return mime.startsWith('audio/'); }
 function isVideo(mime) { return mime.startsWith('video/'); }
 function isPDF(mime) { return mime === 'application/pdf'; }
+function isFont(mime) { return mime.startsWith('font/'); }
 
 function buf2b64(buf) {
     const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf),
@@ -245,6 +246,7 @@ function getFileIconSVG(mime, name) {
     if (isAudio(mime)) return _bigIcon('#c678dd', _audioPath());
     if (isVideo(mime)) return _bigIcon('#c678dd', _videoPath());
     if (isPDF(mime)) return _bigIcon('#f44747', _pdfPath());
+    if (isFont(mime)) return _bigIcon('#ebdc13', _fontPath());
     if (isText(mime, name)) {
         if (['js', 'ts', 'py', 'rs', 'go', 'java', 'c', 'cmd', 'cpp', 'cs', 'php', 'rb', 'sh', 'bat', 'ps1', 'vbs'].includes(ext))
             return _bigIcon('#dcdcaa', _codePath());
@@ -280,6 +282,7 @@ function _pdfPath() { return `<path d="M15 23h8M15 28h10M15 33h13" stroke="COLOR
 function _archivePath() { return `<path d="M22 4v40M18 12h8M18 18h8M18 24h8M18 30h8" stroke="COLOR" stroke-width="1.8" stroke-linecap="square" opacity=".7"/>`; }
 function _docPath() { return `<path d="M16 23h16M16 28h16M16 33h10" stroke="COLOR" stroke-width="1.8" stroke-linecap="square" opacity=".7"/><path d="M32 21l2 2-2 2" stroke="COLOR" stroke-width="1.5" stroke-linecap="round" opacity=".6"/>`; }
 function _slidePath() { return `<rect x="14" y="20" width="20" height="14" rx="1" stroke="COLOR" stroke-width="1.5" opacity=".7"/><path d="M24 27l-4-4v8z" fill="COLOR" opacity=".6"/>`; }
+function _fontPath() { return `<path d="M16 31l12-12 3 3-12 12h-3v-3zM25 16l3 3" stroke="COLOR" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" opacity=".8"/><path d="M30 21v6h5" stroke="COLOR" stroke-width="1.5" stroke-linecap="square" opacity=".5"/>`; }
 
 function _bigIconExt(color, extText) {
     const fs = extText.length <= 2 ? 14 : extText.length === 3 ? 12 : 10;
