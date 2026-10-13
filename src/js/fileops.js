@@ -19,10 +19,19 @@ async function uploadFiles(files, targetFolderId = App.folder) {
     if (!App.key || !App.container) return;
     if (!files || !files.length) return;
 
+    const names = new Set(VFS.children(targetFolderId).map(n => n.name.toLowerCase()));
+    const fileArr = Array.from(files).filter(f => {
+        const name = sanitizeFilename(f.name).toLowerCase();
+        if (names.has(name)) { toast(`"${sanitizeFilename(f.name)}" already exists — skipped`, 'warn'); return false; }
+        names.add(name);
+        return true;
+    });
+    if (!fileArr.length) return;
+
     // Container size check
     const remaining = CONTAINER_LIMIT - VFS.totalSize();
     let totalNew = 0;
-    for (const f of files) totalNew += f.size;
+    for (const f of fileArr) totalNew += f.size;
     if (totalNew > remaining) {
         toast(`Not enough space in container. Need ${fmtSize(totalNew)}, have ${fmtSize(remaining)}`, 'error');
         return;
@@ -38,46 +47,55 @@ async function uploadFiles(files, targetFolderId = App.folder) {
         return;
     }
 
-    showLoading(`Encrypting ${files.length} file${files.length > 1 ? 's' : ''}...`);
+    showLoading(`Encrypting ${fileArr.length} file${fileArr.length > 1 ? 's' : ''}...`);
     let ok = 0, _okIds = [];
-    const fileArr = Array.from(files);
     const BATCH = _CRYPTO_CONCURRENCY;
-    for (let i = 0; i < fileArr.length; i += BATCH) {
-        const batch = fileArr.slice(i, i + BATCH);
-        // Read all file buffers in this batch concurrently before encrypting
-        const bufs = await Promise.all(batch.map(f => f.arrayBuffer()));
-        const results = await Promise.allSettled(batch.map(async (f, bi) => {
-            const name = sanitizeFilename(f.name),
-                mime = f.type || getMime(name),
-                { iv, blob } = await Crypto.encryptBin(App.key, bufs[bi]),
-                nodeId = uid();
-            VFS.add({
-                id: nodeId, type: 'file', name, mime, size: f.size,
-                parentId: targetFolderId, ctime: Date.now(), mtime: Date.now()
-            });
-            return { nodeId, rec: { id: nodeId, cid: App.container.id, iv: Array.from(iv), blob } };
-        }));
-        // Batch-save all encrypted records in a single IDB transaction
-        const recs = [];
-        for (let j = 0; j < results.length; j++) {
-            if (results[j].status === 'fulfilled') {
-                ok++;
-                _okIds.push(results[j].value.nodeId);
-                recs.push(results[j].value.rec);
-            } else {
-                console.error('upload error', batch[j].name, results[j].reason);
-                toast('Failed to encrypt: ' + batch[j].name, 'error');
+    try {
+        for (let i = 0; i < fileArr.length; i += BATCH) {
+            const batch = fileArr.slice(i, i + BATCH);
+            // Isolate read/encryption errors so other files in the batch can still import.
+            const results = await Promise.allSettled(batch.map(async f => {
+                const buf = await f.arrayBuffer();
+                const name = sanitizeFilename(f.name),
+                    mime = f.type || getMime(name),
+                    { iv, blob } = await Crypto.encryptBin(App.key, buf),
+                    nodeId = uid();
+                const node = {
+                    id: nodeId, type: 'file', name, mime, size: f.size,
+                    parentId: targetFolderId, ctime: Date.now(), mtime: Date.now()
+                };
+                return { node, rec: { id: nodeId, cid: App.container.id, iv: Array.from(iv), blob } };
+            }));
+            // Batch-save all encrypted records in a single IDB transaction
+            const added = [];
+            for (let j = 0; j < results.length; j++) {
+                if (results[j].status === 'fulfilled') {
+                    added.push(results[j].value);
+                } else {
+                    console.error('upload error', batch[j].name, results[j].reason);
+                    toast('Failed to import: ' + batch[j].name, 'error');
+                }
             }
+            if (added.length) {
+                await DB.saveFiles(added.map(item => item.rec));
+                for (const item of added) {
+                    VFS.add(item.node);
+                    _okIds.push(item.node.id);
+                    ok++;
+                }
+            }
+            showLoading(`Encrypting... ${Math.min(i + BATCH, fileArr.length)}/${fileArr.length}`);
         }
-        if (recs.length) await DB.saveFiles(recs);
-        showLoading(`Encrypting... ${Math.min(i + BATCH, fileArr.length)}/${fileArr.length}`);
+    } catch (e) {
+        console.error('upload error', e);
+        toast('Import failed: ' + e.message, 'error');
     }
     await saveVFS();
     Desktop._patchIcons();
     hideLoading();
     if (ok > 0) {
         toast(`${ok} file${ok > 1 ? 's' : ''} imported`, 'success');
-        logActivity('upload', ok === 1 ? files[0].name : `${ok} files`, ok, ok === 1 && _okIds[0] ? VFS.fullPath(_okIds[0]) : null);
+        logActivity('upload', ok === 1 ? VFS.node(_okIds[0]).name : `${ok} files`, ok, ok === 1 && _okIds[0] ? VFS.fullPath(_okIds[0]) : null);
         _scheduleExportCacheRefresh();
     }
 }
@@ -328,7 +346,14 @@ async function deleteSelected() {
                 walk(id);
             }
         }
-        if (allFileIds.length) await DB.deleteFiles(allFileIds).catch(() => { });
+        try {
+            if (allFileIds.length) await DB.deleteFiles(allFileIds);
+        } catch (e) {
+            console.error('delete error', e);
+            hideLoading();
+            toast('Delete failed: ' + e.message, 'error');
+            return;
+        }
         allFileIds.forEach(fid => { delete App.thumbCache[fid]; });
         const _delSinglePath = ids.length === 1 ? VFS.fullPath(ids[0]) : null;
         for (const id of ids) VFS.remove(id);
@@ -859,6 +884,7 @@ function _scheduleLineNumberUpdate() {
    ============================================================ */
 let _editorNode = null;
 let _editorOriginal = '';
+let _editorSaving = false;
 
 function openEditor(node, buf) {
     _editorNode = node;
@@ -923,13 +949,16 @@ function openEditor(node, buf) {
 }
 
 async function saveEditor() {
-    if (!_editorNode || !App.key) return;
+    if (!_editorNode || !App.key || _editorSaving) return false;
 
-    const text = document.getElementById('editor-textarea').value;
+    const node = _editorNode;
+    const key = App.key, cid = App.container.id;
+    const ta = document.getElementById('editor-textarea');
+    const text = ta.value;
     const buf = new TextEncoder().encode(text);
     // Container limit check: compare projected total against CONTAINER_LIMIT.
     // VFS.totalSize() still contains the old size for this node at this point.
-    const _oldSize = _editorNode.size || 0;
+    const _oldSize = node.size || 0;
     const _delta = buf.byteLength - _oldSize;
     if (_delta > 0 && VFS.totalSize() + _delta > CONTAINER_LIMIT) {
         toast(`Cannot save: container limit reached (${fmtSize(CONTAINER_LIMIT)})`, 'error');
@@ -942,23 +971,28 @@ async function saveEditor() {
         return;
     }
 
+    if (_editorSaving) return false;
+    _editorSaving = true;
     let saved = false;
     showLoading('Saving...');
     try {
-        const { iv, blob } = await Crypto.encryptBin(App.key, buf.buffer);
-        _editorNode.size = buf.byteLength;
-        _editorNode.mtime = Date.now();
-        VFS.add(_editorNode);
-        await DB.saveFile({ id: _editorNode.id, cid: App.container.id, iv: Array.from(iv), blob });
-        _editorOriginal = text;
-        document.getElementById('editor-meta-modified').style.display = 'none';
+        const { iv, blob } = await Crypto.encryptBin(key, buf.buffer);
+        await DB.saveFile({ id: node.id, cid, iv: Array.from(iv), blob });
+        node.size = buf.byteLength;
+        node.mtime = Date.now();
+        VFS.add(node);
         await saveVFS();
+        if (_editorNode === node) {
+            _editorOriginal = text;
+            document.getElementById('editor-meta-modified').style.display = ta.value === text ? 'none' : '';
+        }
         Desktop._patchIcons();
         toast('File saved', 'success');
-        logActivity('edit', _editorNode.name, 1, VFS.fullPath(_editorNode.id));
+        logActivity('edit', node.name, 1, VFS.fullPath(node.id));
         _scheduleExportCacheRefresh();
         saved = true;
     } catch (e) { toast('Save failed: ' + e.message, 'error'); console.error(e); }
+    _editorSaving = false;
     hideLoading();
     return saved;
 }
@@ -991,8 +1025,11 @@ function discardEditor() {
 }
 
 async function saveAndCloseEditor() {
+    const node = _editorNode;
     const ok = await saveEditor();
-    if (ok) { Overlay.hide(); _editorNode = null; _clearEditorMemory(); }
+    if (ok && _editorNode === node && document.getElementById('editor-textarea').value === _editorOriginal) {
+        Overlay.hide(); _editorNode = null; _clearEditorMemory();
+    }
 }
 
 /* ============================================================
@@ -1094,12 +1131,7 @@ function _buildCustomPlayer(url, kind) {
     media.addEventListener('pause', () => { btnPlay.innerHTML = playIcon; });
     media.addEventListener('ended', () => { btnPlay.innerHTML = playIcon; });
 
-    let _seeking = false;
-    seek.addEventListener('mousedown', () => { _seeking = true; });
-    seek.addEventListener('touchstart', () => { _seeking = true; }, { passive: true });
-    seek.addEventListener('input', () => { if (_seeking) media.currentTime = seek.value; });
-    seek.addEventListener('mouseup', () => { _seeking = false; media.currentTime = seek.value; });
-    seek.addEventListener('touchend', () => { _seeking = false; media.currentTime = seek.value; });
+    seek.addEventListener('input', () => { media.currentTime = seek.value; });
 
     // Volume
     const btnVol = document.createElement('button');
@@ -1394,6 +1426,7 @@ async function exportAsZip(nodeIds, zipName) {
             _zipSeen.add(nodeId);
             const n = VFS.node(nodeId); if (!n) return;
             if (n.type === 'folder') {
+                entries.push({ name: prefix + n.name + '/', data: new Uint8Array(0), mtime: n.mtime || n.ctime });
                 for (const c of VFS.children(nodeId)) _collectFlat(c.id, prefix + n.name + '/', _depth + 1);
             } else {
                 _flat.push({ id: nodeId, name: prefix + n.name, mtime: n.mtime || n.ctime });
@@ -1403,16 +1436,18 @@ async function exportAsZip(nodeIds, zipName) {
         // Fetch all file records in one IDB transaction, then decrypt fully in parallel
         const fileMap = await DB.getFilesByIds(_flat.map(f => f.id));
         const decResults = await Promise.allSettled(_flat.map(async item => {
-            const rec = fileMap.get(item.id); if (!rec) return null;
+            const rec = fileMap.get(item.id); if (!rec) throw new Error('File data not found: ' + item.name);
             const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
             return { name: item.name, data: new Uint8Array(buf), mtime: item.mtime };
         }));
+        const failed = decResults.find(r => r.status === 'rejected');
+        if (failed) throw failed.reason;
         decResults.forEach(r => { if (r.status === 'fulfilled' && r.value) entries.push(r.value); });
         if (!entries.length) { toast('Nothing to export', 'warn'); hideLoading(); return; }
         const zipParts = _buildZip(entries);
         downloadBuf(zipParts, zipName, 'application/zip');
-        toast(`Exported ${entries.length} file${entries.length !== 1 ? 's' : ''} as ZIP`, 'success');
-        logActivity('export-zip', nodeIds.length === 1 ? (VFS.node(nodeIds[0])?.name ?? entries[0]?.name ?? '1 file') : `${entries.length} files`, entries.length, nodeIds.length === 1 ? VFS.fullPath(nodeIds[0]) : null);
+        toast(`Exported ${_flat.length} file${_flat.length !== 1 ? 's' : ''} as ZIP`, 'success');
+        logActivity('export-zip', nodeIds.length === 1 ? (VFS.node(nodeIds[0])?.name ?? entries[0]?.name ?? '1 file') : `${_flat.length} files`, _flat.length, nodeIds.length === 1 ? VFS.fullPath(nodeIds[0]) : null);
     } catch (e) { toast('ZIP export failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
 }

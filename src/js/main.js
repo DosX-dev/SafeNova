@@ -91,7 +91,10 @@ function initEvents() {
     document.getElementById('nc-pw2').addEventListener('keydown', e => { if (e.key === 'Enter') createContainer(); });
 
     /* ---- Unlock ---- */
-    document.getElementById('btn-back').addEventListener('click', () => App.showView('home'));
+    document.getElementById('btn-back').addEventListener('click', () => {
+        cancelUnlock();
+        App.showView('home');
+    });
     document.getElementById('btn-unlock').addEventListener('click', doUnlock);
     document.getElementById('unlock-pw').addEventListener('keydown', e => { if (e.key === 'Enter') doUnlock(); });
     document.getElementById('unlock-pw-eye').addEventListener('click', () => togglePwEye('unlock-pw', 'unlock-pw-eye'));

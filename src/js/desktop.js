@@ -2000,6 +2000,8 @@ function _rubberBandSelect(e, area, sel, onUpdate) {
 function _startIconDrag(e, node, el, srcCtx) {
     e.stopPropagation(); e.preventDefault();
     _cancelHoverTooltip();
+    // preventDefault suppresses the browser's normal focus transfer on click.
+    srcCtx.area.focus({ preventScroll: true });
 
     const wasSelected = srcCtx.selection.has(node.id);
     if (!e.ctrlKey && !e.metaKey && !wasSelected) srcCtx.clearAll();
@@ -2324,6 +2326,12 @@ function _startIconDrag(e, node, el, srcCtx) {
                 srcCtx.selection.delete(node.id);
                 el.classList.remove('selected');
                 srcCtx.updateUI();
+            } else if (!e.ctrlKey && !e.metaKey && srcCtx.selection.size > 1) {
+                // Preserve the group while dragging, but a plain click selects one item.
+                srcCtx.clearAll();
+                srcCtx.selection.add(node.id);
+                el.classList.add('selected');
+                srcCtx.updateUI();
             }
             // Click without drag — restore visibility for FW items
             if (!isDesktop) {
@@ -2533,6 +2541,7 @@ function _handleKey(e, owner, syncCtx, withSync, opts = {}) {
         e.preventDefault();
         syncCtx(); pasteItems();
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyA') {
+        e.preventDefault();
         syncCtx(); selectAll();
     } else if (e.key === 'Escape') {
         if (App.clipboard?.op === 'cut') cancelClipboard();

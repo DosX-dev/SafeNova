@@ -22,14 +22,16 @@ function _highlightCard(cid) {
 
 const Home = {
     async render() {
+        const renderVersion = this._renderVersion = (this._renderVersion || 0) + 1;
         InitLog.step('Home.render');
         const grid = document.getElementById('container-grid'),
             empty = document.getElementById('container-empty'),
             containers = await DB.getContainers();
 
-        grid.querySelectorAll('.container-card').forEach(c => c.remove());
+        if (renderVersion !== this._renderVersion) return;
 
         if (containers.length === 0) {
+            grid.querySelectorAll('.container-card').forEach(c => c.remove());
             empty.style.display = 'flex';
         } else {
             empty.style.display = 'none';
@@ -37,6 +39,8 @@ const Home = {
             for (const c of containers) {
                 if (hasSession(c.id)) await loadSession(c.id);
             }
+            if (renderVersion !== this._renderVersion) return;
+            grid.querySelectorAll('.container-card').forEach(c => c.remove());
             const savedOrder = _loadCardOrder();
             containers.sort((a, b) => {
                 const ia = savedOrder.indexOf(a.id), ib = savedOrder.indexOf(b.id);
@@ -48,6 +52,7 @@ const Home = {
             containers.forEach(c => grid.appendChild(this._makeCard(c)));
         }
         await updateStorageInfo();
+        if (renderVersion !== this._renderVersion) return;
 
         // ---- Persistent visibility: warning box (only when 1+ container exists) ----
         const warnBox = document.getElementById('home-warning-box'),
@@ -730,21 +735,53 @@ function updatePwStrength(pw, barId = 'nc-pw-strength', lblId = 'nc-pw-strength-
    UNLOCK VIEW
    ============================================================ */
 let _unlockContainer = null;
+let _unlockAttempt = null;
+let _unlockCooldownTimer = null;
 const _failCounts = new Map(); // containerId → { count, lockUntil }
+
+function cancelUnlock() {
+    clearInterval(_unlockCooldownTimer);
+    _unlockCooldownTimer = null;
+    _unlockAttempt = null;
+    _unlockContainer = null;
+    document.getElementById('unlock-spinner').classList.remove('show');
+    document.getElementById('btn-unlock').disabled = false;
+    document.getElementById('unlock-error').style.color = '';
+}
 
 function _startUnlockCooldown(c) {
     const fails = _failCounts.get(c.id);
-    _startAttemptCooldown(
-        document.getElementById('unlock-error'),
-        document.getElementById('btn-unlock'),
-        () => { if (fails) fails.lockUntil = 0; }
-    );
+    clearInterval(_unlockCooldownTimer);
+    const update = () => {
+        const remaining = Math.max(0, Math.ceil(((fails?.lockUntil || 0) - Date.now()) / 1000)),
+            errEl = document.getElementById('unlock-error'),
+            btn = document.getElementById('btn-unlock');
+        if (!remaining) {
+            clearInterval(_unlockCooldownTimer);
+            _unlockCooldownTimer = null;
+            if (fails) fails.lockUntil = 0;
+            errEl.innerHTML = '';
+            errEl.style.color = '';
+            btn.disabled = false;
+            return;
+        }
+        errEl.innerHTML = `${_WAIT_SVG} Too many attempts — wait ${remaining}s`;
+        errEl.style.color = 'var(--orange)';
+        btn.disabled = true;
+    };
+    _unlockCooldownTimer = setInterval(update, 200);
+    update();
 }
 
 function openUnlockView(c) {
+    cancelUnlock();
     _unlockContainer = c;
     document.getElementById('unlock-name').textContent = c.name;
     document.getElementById('unlock-pw').value = '';
+    document.getElementById('unlock-pw').type = 'password';
+    const eyeBtn = document.getElementById('unlock-pw-eye');
+    eyeBtn.style.color = '';
+    eyeBtn.innerHTML = Icons.eye;
     document.getElementById('unlock-error').innerHTML = '';
     document.getElementById('unlock-spinner').classList.remove('show');
     // Pre-fill checkbox and scope based on saved session
@@ -767,6 +804,7 @@ function openUnlockView(c) {
         else if (tabEl) tabEl.checked = true;
     }
     App.showView('unlock');
+    if ((_failCounts.get(c.id)?.lockUntil || 0) > Date.now()) _startUnlockCooldown(c);
     setTimeout(() => document.getElementById('unlock-pw').focus(), 100);
 }
 
@@ -820,6 +858,7 @@ async function _executeDuress(c) {
 }
 
 async function doUnlock() {
+    if (_unlockAttempt || App.view !== 'unlock') return;
     const c = _unlockContainer; if (!c) return;
     const pw = document.getElementById('unlock-pw').value;
     if (!pw) { document.getElementById('unlock-error').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg> Enter password'; return; }
@@ -827,6 +866,11 @@ async function doUnlock() {
     // Brute-force protection: check if currently locked out
     const fails = _failCounts.get(c.id) || { count: 0, lockUntil: 0 };
     if (fails.lockUntil > Date.now()) return; // button is already disabled during lockout
+    _failCounts.set(c.id, fails);
+
+    const attempt = {};
+    _unlockAttempt = attempt;
+    const isCurrent = () => _unlockAttempt === attempt && App.view === 'unlock';
 
     document.getElementById('unlock-error').innerHTML = '';
     document.getElementById('unlock-spinner').classList.add('show');
@@ -842,9 +886,10 @@ async function doUnlock() {
             if (await checkDuress(pw, c)) await _executeDuress(c);
             fails.count++;
             _failCounts.set(c.id, fails);
+            if (fails.count > 3) fails.lockUntil = Date.now() + 3000;
+            if (!isCurrent()) return;
             document.getElementById('unlock-spinner').classList.remove('show');
             if (fails.count > 3) {
-                fails.lockUntil = Date.now() + 3000;
                 _startUnlockCooldown(c);
             } else {
                 document.getElementById('unlock-error').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg> Incorrect password';
@@ -852,17 +897,20 @@ async function doUnlock() {
             }
             return;
         }
+        if (!isCurrent()) return;
 
         // Load VFS (detect binary vs legacy base64 format)
         const vfsRec = await DB.getVFS(c.id);
+        if (!isCurrent()) return;
         if (vfsRec) {
             try {
                 const buf = typeof vfsRec.blob === 'string'
                     ? await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob)
                     : await Crypto.decryptBin(key, vfsRec.iv, vfsRec.blob);
+                if (!isCurrent()) return;
                 const json = JSON.parse(new TextDecoder().decode(buf));
                 VFS.fromObj(json);
-            } catch { VFS.init(); }
+            } catch { if (!isCurrent()) return; VFS.init(); }
         } else { VFS.init(); }
 
         // Expand lazy workspace if this container was imported without a password
@@ -887,13 +935,15 @@ async function doUnlock() {
                 delete cleanCont.lazyWorkspace;
                 await DB.saveContainer(cleanCont);
                 _activeCont = cleanCont;
-                _unlockContainer = cleanCont;
             } catch (expandErr) {
                 console.error('Lazy expand failed', expandErr);
-                toast('Could not restore files from import', 'error');
+                if (isCurrent()) toast('Could not restore files from import', 'error');
             }
             hideLoading();
         }
+
+        if (!isCurrent()) return;
+        _unlockContainer = _activeCont;
 
         _failCounts.delete(c.id); // reset fail count on successful unlock
 
@@ -923,11 +973,16 @@ async function doUnlock() {
             clearSession(c.id);
         }
     } catch (e) {
+        if (!isCurrent()) return;
         document.getElementById('unlock-error').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg> ' + escHtml(e.message);
         console.error(e);
+    } finally {
+        if (_unlockAttempt === attempt) {
+            _unlockAttempt = null;
+            document.getElementById('unlock-spinner').classList.remove('show');
+            document.getElementById('btn-unlock').disabled = (fails.lockUntil || 0) > Date.now();
+        }
     }
-    document.getElementById('unlock-spinner').classList.remove('show');
-    document.getElementById('btn-unlock').disabled = false;
 }
 
 /* ============================================================
