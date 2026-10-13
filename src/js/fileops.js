@@ -15,7 +15,7 @@ function sanitizeFilename(name) {
 /* ============================================================
    UPLOAD FILES  (from OS drag-drop or file picker — flat list)
    ============================================================ */
-async function uploadFiles(files) {
+async function uploadFiles(files, targetFolderId = App.folder) {
     if (!App.key || !App.container) return;
     if (!files || !files.length) return;
 
@@ -53,7 +53,7 @@ async function uploadFiles(files) {
                 nodeId = uid();
             VFS.add({
                 id: nodeId, type: 'file', name, mime, size: f.size,
-                parentId: App.folder, ctime: Date.now(), mtime: Date.now()
+                parentId: targetFolderId, ctime: Date.now(), mtime: Date.now()
             });
             return { nodeId, rec: { id: nodeId, cid: App.container.id, iv: Array.from(iv), blob } };
         }));
@@ -175,7 +175,7 @@ async function uploadEntries(dataTransferItems, targetFolderId) {
     if (!entries.length) {
         // Fallback: no Entry API support — treat all as flat files
         const files = itemArr.map(i => i.getAsFile?.()).filter(Boolean);
-        if (files.length) await uploadFiles(files);
+        if (files.length) await uploadFiles(files, targetFolderId);
         return;
     }
 
@@ -594,6 +594,19 @@ async function pasteItems() {
             _pastedSn = n.name;
             _pastedIds.push(id);
         } else {
+            // Copying a folder into its own tree would recursively copy the new copy.
+            if (n.type === 'folder') {
+                let parent = folderId;
+                const seen = new Set();
+                while (parent && !seen.has(parent) && parent !== id) {
+                    seen.add(parent);
+                    parent = VFS.node(parent)?.parentId;
+                }
+                if (parent === id) {
+                    toast(`Cannot paste "${n.name}" into itself or a subfolder`, 'error');
+                    continue;
+                }
+            }
             let name = n.name;
             if (VFS.hasChildNamed(folderId, name)) name = _dedupName(folderId, name);
             const newId = await deepCopy(id, folderId, name !== n.name ? name : undefined);
@@ -650,10 +663,10 @@ async function deepCopy(nodeId, newParent, newName, _depth = 0) {
    SELECT ALL / SORT
    ============================================================ */
 function selectAll() {
+    const area = App._winCtx ? App._winCtx.el.querySelector('.fw-area') : document.getElementById('desktop-area');
     VFS.children(App.folder).forEach(n => {
         App.selection.add(n.id);
-        // Look in both main desktop and any folder windows
-        const el = document.querySelector(`.file-item[data-id="${n.id}"]`);
+        const el = area.querySelector(`:scope > .file-item[data-id="${n.id}"]`);
         if (el) el.classList.add('selected');
     });
     if (App._winCtx) App._winCtx._updateStatus();

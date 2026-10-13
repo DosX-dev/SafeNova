@@ -115,12 +115,15 @@ const VFS = (() => {
     function rename(id, newName) {
         const n = _nodes[id];
         if (id !== 'root' && n) {
+            const oldName = n.name;
             n.name = newName;
             n.mtime = Date.now();
-            // Refresh mime when the file extension changes so icon and viewer
-            // reflect the new type rather than the original upload type.
-            if (n.type === 'file' && typeof getMime === 'function') {
-                n.mime = getMime(newName);
+            // Keep the upload's MIME for an unchanged or unrecognized extension.
+            // Renaming an extensionless image must not disable its viewer.
+            if (n.type === 'file' && typeof getMime === 'function' &&
+                (!n.mime || getExt(oldName) !== getExt(newName))) {
+                const mime = getMime(newName);
+                if (mime !== 'application/octet-stream' || !n.mime) n.mime = mime;
             }
         }
     }

@@ -294,6 +294,7 @@ function killSession(c) {
 }
 
 /* ---- Change Password ---- */
+let _changingPassword = false;
 function openChangePasswordModal(c) {
     ['cp-old', 'cp-new', 'cp-new2'].forEach(id => {
         const el = document.getElementById(id); el.value = ''; el.type = 'password';
@@ -308,11 +309,25 @@ function openChangePasswordModal(c) {
     document.getElementById('cp-pw-strength-label').style.display = 'none';
     document.getElementById('cp-error').innerHTML = '';
     document.getElementById('cp-ok')._container = c;
+    document.getElementById('cp-ok').disabled = _changingPassword ||
+        (_failCounts.get('cp:' + c.id)?.lockUntil || 0) > Date.now();
     Overlay.show('modal-change-pw');
     setTimeout(() => document.getElementById('cp-old').focus(), 100);
 }
 
 async function doChangePassword() {
+    if (_changingPassword) return;
+    _changingPassword = true;
+    try {
+        await _changePassword();
+    } finally {
+        _changingPassword = false;
+        const okBtn = document.getElementById('cp-ok');
+        okBtn.disabled = (_failCounts.get('cp:' + okBtn._container?.id)?.lockUntil || 0) > Date.now();
+    }
+}
+
+async function _changePassword() {
     const okBtn = document.getElementById('cp-ok'),
         c = okBtn._container;
     if (!c) return;
@@ -463,7 +478,7 @@ async function doRenameContainer() {
     if (!name) { errEl.textContent = 'Enter a name'; return; }
     const nameRegex = /^[a-zA-Zа-яА-ЯёЁ0-9 _\-.,!()@#$%&+=]+$/;
     if (!nameRegex.test(name)) { errEl.textContent = 'Invalid characters in name'; return; }
-    if (name.toLowerCase() === c.name.toLowerCase()) { Overlay.hide(); return; }
+    if (name === c.name) { Overlay.hide(); return; }
 
     const existing = await DB.getContainers();
     if (existing.find(x => x.id !== c.id && x.name.toLowerCase() === name.toLowerCase())) {
@@ -633,7 +648,20 @@ async function _webAuthnSalt() {
     return Array.from(new Uint8Array(hashBuf));
 }
 
+let _creatingContainer = false;
 async function createContainer() {
+    if (_creatingContainer) return;
+    _creatingContainer = true;
+    document.getElementById('nc-create').disabled = true;
+    try {
+        await _createContainer();
+    } finally {
+        _creatingContainer = false;
+        document.getElementById('nc-create').disabled = !document.getElementById('nc-agree').checked;
+    }
+}
+
+async function _createContainer() {
     const name = document.getElementById('nc-name').value.trim(),
         pw = document.getElementById('nc-pw').value,
         pw2 = document.getElementById('nc-pw2').value;

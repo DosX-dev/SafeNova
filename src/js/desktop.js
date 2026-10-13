@@ -2537,7 +2537,7 @@ function _handleKey(e, owner, syncCtx, withSync, opts = {}) {
     } else if (e.key === 'Escape') {
         if (App.clipboard?.op === 'cut') cancelClipboard();
         owner.selection.clear();
-        (opts.area || document).querySelectorAll('.file-item.selected').forEach(i => i.classList.remove('selected'));
+        (opts.area || document).querySelectorAll(opts.area ? ':scope > .file-item.selected' : '.file-item.selected').forEach(i => i.classList.remove('selected'));
         owner._updateStatus();
     } else if (e.key === 'F2' && owner.selection.size === 1) {
         renameNode(VFS.node([...owner.selection][0]));
@@ -2637,6 +2637,8 @@ function _buildIconMenuItems(node, sel, opts) {
 
 /* ---- Shared icon-area render (Desktop + FolderWindow): full rebuild or incremental ---- */
 function _renderIconArea(area, folderId, selection, updateStatusFn, forceRebuild) {
+    // Every render supersedes queued chunks, including navigation to an empty folder.
+    const token = (area._renderToken = (area._renderToken || 0) + 1);
     const items = VFS.children(folderId);
     items.sort((a, b) => a.type !== b.type ? (a.type === 'folder' ? -1 : 1) : a.name.localeCompare(b.name));
     area.classList.toggle('no-grid-dots', !_getSettings().gridDots);
@@ -2653,7 +2655,6 @@ function _renderIconArea(area, folderId, selection, updateStatusFn, forceRebuild
         const needPos = items.filter(n => !VFS.getPos(folderId, n.id));
         if (needPos.length) VFS.autoPosBatch(folderId, needPos, area);
         const useAnim = items.length <= 200;
-        const token = (area._renderToken = (area._renderToken || 0) + 1);
         const renderChunk = (start) => {
             if (area._renderToken !== token) return;
             const frag = document.createDocumentFragment(),
@@ -3337,8 +3338,8 @@ class FolderWindow {
         showCtxMenu(e.clientX, e.clientY, _buildIconMenuItems(node, this.selection, {
             openFn: n => n.type === 'folder' ? this._openNode(n) : openFile(n),
             colorCb: () => this.render(),
-            hasCopy: false,
-            copyFn: null,
+            hasCopy: true,
+            copyFn: () => this._withCtxSync(() => copyItems()),
             cutFn: () => this._withCtxSync(() => cutItems()),
             exportZipFn: () => this._withCtxSync(() => exportAsZip([...this.selection])),
             deleteFn: () => { this._setCtx(); deleteSelected(); },
@@ -3374,7 +3375,7 @@ class FolderWindow {
 
     _onKey(e) {
         _handleKey(e, this, () => this._setCtx(), fn => this._withCtxSync(fn), {
-            area: this.el,
+            area: this.el.querySelector('.fw-area'),
             refresh: () => { this.render(); this.el.querySelector('.fw-area')?.focus(); },
             extraKeys: ev => {
                 if (ev.key === 'Backspace' && !ev.ctrlKey && !ev.metaKey) {

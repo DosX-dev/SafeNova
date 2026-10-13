@@ -37,13 +37,13 @@ async function fixture(browser) {
     }
     await page.evaluate(() => {
         // Isolate storage and taskbar UI; keep real VFS, handlers, copy and icon rendering.
-        saveVFS = async () => {};
-        toast = () => {};
-        _scheduleExportCacheRefresh = () => {};
+        saveVFS = async () => { };
+        toast = () => { };
+        _scheduleExportCacheRefresh = () => { };
         window.logs = [];
         logActivity = (...args) => logs.push(args);
-        Desktop._updateSelectionBar = () => {};
-        Desktop.updateTaskbar = () => {};
+        Desktop._updateSelectionBar = () => { };
+        Desktop.updateTaskbar = () => { };
         VFS.init();
         for (const id of ['source', 'target', 'other']) {
             VFS.add({ id, type: 'folder', name: id, parentId: 'root' });
