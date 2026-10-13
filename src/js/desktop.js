@@ -2530,6 +2530,7 @@ function _handleKey(e, owner, syncCtx, withSync, opts = {}) {
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyX' && owner.selection.size > 0) {
         withSync(() => cutItems());
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
+        e.preventDefault();
         syncCtx(); pasteItems();
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyA') {
         syncCtx(); selectAll();
@@ -2957,6 +2958,8 @@ const Desktop = {
     },
 
     _onKey(e) {
+        // Folder windows are inside desktop-area and handle their own shortcuts.
+        if (e.target.closest('.folder-window')) return;
         const sync = () => { App.folder = this._desktopFolder; App.selection = this._sel; App._winCtx = null; };
         _handleKey(e, this, sync, fn => { sync(); fn(); }, {
             area: document.getElementById('desktop-area'),

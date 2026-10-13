@@ -566,6 +566,9 @@ function _dedupName(folderId, name) {
 async function pasteItems() {
     if (!App.clipboard) return;
     const { op, ids } = App.clipboard;
+    // Keep the destination stable while copying blobs asynchronously.
+    const folderId = App.folder, winCtx = App._winCtx, screenPos = App._ctxScreenPos;
+    App._ctxScreenPos = null;
 
     // Prevent pasting a cut folder if it's currently open in Explorer windows
     if (op === 'cut') {
@@ -584,39 +587,37 @@ async function pasteItems() {
     for (const id of ids) {
         const n = VFS.node(id); if (!n) continue;
         if (op === 'cut') {
-            if (n.parentId === App.folder) continue;
-            const result = VFS.move(id, App.folder);
+            if (n.parentId === folderId) continue;
+            const result = VFS.move(id, folderId);
             if (result === 'duplicate') { toast(`"${n.name}" already exists in this folder`, 'error'); continue; }
             if (result === 'cycle') { toast(`Cannot paste "${n.name}" into itself or a subfolder`, 'error'); continue; }
             _pastedSn = n.name;
             _pastedIds.push(id);
         } else {
             let name = n.name;
-            if (VFS.hasChildNamed(App.folder, name)) name = _dedupName(App.folder, name);
-            const newId = await deepCopy(id, App.folder, name !== n.name ? name : undefined);
+            if (VFS.hasChildNamed(folderId, name)) name = _dedupName(folderId, name);
+            const newId = await deepCopy(id, folderId, name !== n.name ? name : undefined);
             _pastedSn = name;
             if (newId) _pastedIds.push(newId);
         }
     }
     // Position pasted items at the context-menu cursor (set by right-click / long-press Paste)
-    if (App._ctxScreenPos && _pastedIds.length > 0) {
-        const winCtx = App._winCtx;
+    if (screenPos && _pastedIds.length > 0) {
         const area2 = winCtx ? winCtx.el.querySelector('.fw-area') : document.getElementById('desktop-area');
         const rect2 = area2.getBoundingClientRect();
-        const rawX = App._ctxScreenPos.x - rect2.left + area2.scrollLeft;
-        const rawY = App._ctxScreenPos.y - rect2.top + area2.scrollTop;
+        const rawX = screenPos.x - rect2.left + area2.scrollLeft;
+        const rawY = screenPos.y - rect2.top + area2.scrollTop;
         const occ = new Map();
-        VFS.children(App.folder).forEach(n => {
+        VFS.children(folderId).forEach(n => {
             if (_pastedIds.includes(n.id)) return;
-            const p = VFS.getPos(App.folder, n.id);
+            const p = VFS.getPos(folderId, n.id);
             if (p) occ.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
         });
         _pastedIds.forEach(id => {
             const snapped = _snapFreeCell(rawX, rawY, occ);
-            VFS.setPos(App.folder, id, snapped.x, snapped.y);
+            VFS.setPos(folderId, id, snapped.x, snapped.y);
             occ.set(`${Math.round((snapped.x - 8) / GRID_X)}_${Math.round((snapped.y - 8) / GRID_Y)}`, id);
         });
-        App._ctxScreenPos = null;
     }
     if (op === 'cut') App.clipboard = null;
     _applyCutStyles();
@@ -624,7 +625,7 @@ async function pasteItems() {
     // Refresh all open views so both source and target folders update
     Desktop._patchIcons();
     if (typeof WinManager !== 'undefined') WinManager.renderAll();
-    logActivity('paste', ids.length === 1 ? (_pastedSn ?? VFS.node(ids[0])?.name ?? '1 item') : `${ids.length} items`, ids.length, _srcFolderPath, VFS.fullPath(App.folder));
+    logActivity('paste', ids.length === 1 ? (_pastedSn ?? VFS.node(ids[0])?.name ?? '1 item') : `${ids.length} items`, ids.length, _srcFolderPath, VFS.fullPath(folderId));
     // Copy paste creates new file blobs — refresh the export cache
     if (op === 'copy') _scheduleExportCacheRefresh();
 }
