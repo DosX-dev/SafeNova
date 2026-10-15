@@ -30,6 +30,7 @@ async function fixture(browser) {
                 return records.get(id);
             },
             saveFile: async record => records.set(record.id, record),
+            saveFiles: async recs => recs.forEach(record => records.set(record.id, record)),
         };
     });
     for (const file of ['constants.js', 'vfs.js', 'desktop.js', 'fileops.js']) {
