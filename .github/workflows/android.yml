@@ -1,0 +1,69 @@
+name: Android Build
+
+on:
+  workflow_dispatch: 
+  schedule:
+    - cron: '0 3 * * *' 
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+          
+      - name: Checkout your repository
+        uses: actions/checkout@v6
+
+      - name: Clone SafeNova Repository
+        run: git clone https://github.com/DosX-dev/SafeNova.git SafeNova
+
+      - name: Prepare Capacitor
+        run: |
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          npx cap init "SafeNova" "com.dosx.safenova" --web-dir "SafeNova/src"
+          npx cap add android
+
+      - name: Fix Kotlin & Setup Signing
+        run: |
+          cat << 'EOF' >> android/app/build.gradle
+          configurations.all {
+              resolutionStrategy {
+                  force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
+                  force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22'
+                  force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+              }
+          }
+          EOF
+          
+          sed -i 's/release {/release {\n            signingConfig signingConfigs.debug/g' android/app/build.gradle
+
+      - name: Build Release APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Rename APK
+        run: |
+          mv android/app/build/outputs/apk/release/app-release.apk SafeNova.apk
+
+      - name: Create / Update Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: android-build
+          name: Android Build
+          files: SafeNova.apk
