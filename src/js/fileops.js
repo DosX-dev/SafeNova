@@ -1538,6 +1538,7 @@ function _askExportPassword(c) {
         const btnOk = document.getElementById('exp-ok');
         document.getElementById('exp-cont-name').textContent = c.name;
         document.getElementById('exp-pw').value = '';
+        setPwVisibility('exp-pw', 'exp-eye');
         errEl.innerHTML = '';
         errEl.style.color = '';
         btnOk.disabled = false;

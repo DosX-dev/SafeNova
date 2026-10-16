@@ -304,9 +304,8 @@ function openChangePasswordModal(c) {
     ['cp-old', 'cp-new', 'cp-new2'].forEach(id => {
         const el = document.getElementById(id); el.value = ''; el.type = 'password';
     });
-    ['cp-old-eye', 'cp-new-eye'].forEach(id => {
-        const btn = document.getElementById(id); if (btn) { btn.style.color = ''; btn.innerHTML = Icons.eye; }
-    });
+    setPwVisibility('cp-old', 'cp-old-eye');
+    setPwVisibility('cp-new', 'cp-new-eye');
     document.getElementById('cp-pw-strength').style.width = '0%';
     document.getElementById('cp-pw-strength').style.height = '0';
     document.getElementById('cp-pw-strength').style.marginTop = '0';
@@ -589,6 +588,7 @@ function openNewContainerModal() {
     document.getElementById('nc-name').value = '';
     document.getElementById('nc-pw').value = '';
     document.getElementById('nc-pw2').value = '';
+    setPwVisibility('nc-pw', 'nc-pw-eye');
     document.getElementById('nc-pw-strength').style.width = '0%';
     document.getElementById('nc-pw-strength').style.height = '0';
     document.getElementById('nc-pw-strength').style.marginTop = '0';
@@ -778,10 +778,7 @@ function openUnlockView(c) {
     _unlockContainer = c;
     document.getElementById('unlock-name').textContent = c.name;
     document.getElementById('unlock-pw').value = '';
-    document.getElementById('unlock-pw').type = 'password';
-    const eyeBtn = document.getElementById('unlock-pw-eye');
-    eyeBtn.style.color = '';
-    eyeBtn.innerHTML = Icons.eye;
+    setPwVisibility('unlock-pw', 'unlock-pw-eye');
     document.getElementById('unlock-error').innerHTML = '';
     document.getElementById('unlock-spinner').classList.remove('show');
     // Pre-fill checkbox and scope based on saved session

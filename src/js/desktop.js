@@ -818,11 +818,10 @@ function _updateDuressUI(isActive) {
 
 function _resetDuressForm() {
     const pw = document.getElementById('duress-pw'),
-        pw2 = document.getElementById('duress-pw2'),
-        eye1 = document.getElementById('duress-pw-eye');
+        pw2 = document.getElementById('duress-pw2');
     pw.value = ''; pw2.value = '';
     pw.type = 'password'; pw2.type = 'password';
-    eye1.style.color = ''; eye1.innerHTML = Icons.eye;
+    setPwVisibility('duress-pw', 'duress-pw-eye');
     document.getElementById('duress-pw-strength').style.width = '0%';
     document.getElementById('duress-pw-strength').style.height = '0';
     document.getElementById('duress-pw-strength').style.marginTop = '0';
